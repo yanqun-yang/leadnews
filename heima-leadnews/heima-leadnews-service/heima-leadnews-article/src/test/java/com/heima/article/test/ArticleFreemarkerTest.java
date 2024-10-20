@@ -43,7 +43,7 @@ public class ArticleFreemarkerTest {
     public void createStaticUrlTest() throws Exception {
         //已知文章的id
         //1.获取文章内容
-        ApArticleContent apArticleContent = apArticleContentMapper.selectOne(Wrappers.<ApArticleContent>lambdaQuery().eq(ApArticleContent::getArticleId, 1383827787629252610L));
+        ApArticleContent apArticleContent = apArticleContentMapper.selectOne(Wrappers.<ApArticleContent>lambdaQuery().eq(ApArticleContent::getArticleId, 1846534901076201473L));
         if (apArticleContent != null && StringUtils.isNotBlank(apArticleContent.getContent())) {
             //2.文章内容通过freemarker生成html文件
             Template template = configuration.getTemplate("article.ftl");

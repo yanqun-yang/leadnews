@@ -22,7 +22,7 @@
 
         <van-row type="flex" align="center" class="article-header">
             <van-col span="3">
-                <van-image round class="article-avatar" src="https://p3.pstatp.com/thumb/1480/7186611868"></van-image>
+                <van-image round class="article-avatar" src="https://ts1.cn.mm.bing.net/th/id/R-C.014342e5da2d2edbc7ed276a340b9ade?rik=6mlgLSKlLlKx0w&riu=http%3a%2f%2fimg.zcool.cn%2fcommunity%2f01936a58be7362a801219c77fe8358.jpg%402o.jpg&ehk=biIJF7OQgF2%2bIzEcRuD%2bFhUddJeZs23CgtlTGXZ%2fcHU%3d&risl=&pid=ImgRaw&r=0"></van-image>
             </van-col>
             <van-col span="16">
                 <div v-html="authorName"></div>
