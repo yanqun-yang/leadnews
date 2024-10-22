@@ -19,6 +19,7 @@ import com.heima.wemedia.mapper.WmNewsMapper;
 import com.heima.wemedia.mapper.WmSensitiveMapper;
 import com.heima.wemedia.mapper.WmUserMapper;
 import com.heima.wemedia.service.WmNewsAutoScanService;
+import io.seata.spring.annotation.GlobalTransactional;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.BeanUtils;
@@ -83,7 +84,33 @@ public class WmNewsAutoScanServiceImpl implements WmNewsAutoScanService {
         */
 
             //4.审核成功，保存app端的相关的文章数据
-            ResponseResult responseResult = saveAppArticle(wmNews);
+            try5SaveAppArticle(wmNews);
+        }
+    }
+
+    public void try5SaveAppArticle(WmNews wmNews) {
+        int count = 0;
+        while(count <= 5){
+            try {
+                count += 1;
+                trySaveAppArticle(wmNews);
+                break;
+            } catch (Exception e) {
+                log.info("第{}次尝试", count);
+                e.printStackTrace();
+            }
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    @GlobalTransactional
+    public void trySaveAppArticle(WmNews wmNews) {
+        ResponseResult responseResult = saveAppArticle(wmNews);
+        /*
             int count = 1;
             while(!responseResult.getCode().equals(200) && count <= 5){
                 log.info("第{}次尝试，状态码为{}", count, responseResult.getCode());
@@ -91,14 +118,14 @@ public class WmNewsAutoScanServiceImpl implements WmNewsAutoScanService {
                 count++;
             }
             log.info("第{}次尝试，状态码为{}", count, responseResult.getCode());
+        */
 
-            if(!responseResult.getCode().equals(200)){
-                throw new RuntimeException(responseResult.getCode()+"WmNewsAutoScanServiceImpl-文章审核，保存app端相关文章数据失败");
-            }
-            //回填articl_id
-            wmNews.setArticleId((Long) responseResult.getData());
-            updateWmNews(wmNews, WmNews.Status.PUBLISHED.getCode(), "审核成功");
+        if(!responseResult.getCode().equals(200)){
+            throw new RuntimeException(responseResult.getCode()+"WmNewsAutoScanServiceImpl-文章审核，保存app端相关文章数据失败");
         }
+        //回填articl_id
+        wmNews.setArticleId((Long) responseResult.getData());
+        updateWmNews(wmNews, WmNews.Status.PUBLISHED.getCode(), "审核成功");
     }
 
     @Autowired
