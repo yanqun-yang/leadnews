@@ -2122,6 +2122,7 @@ public class WmNewsServiceImpl  extends ServiceImpl<WmNewsMapper, WmNews> implem
     <img src="截图/自媒体文章发布/文章发布-需求分析.png" alt="文章发布-需求分析" />
 </div>
 
+
 ##### 4.3.2 表结构分析
 
 保存文章，除了需要wm_news表以外，还需要另外两张表
@@ -2176,7 +2177,6 @@ create table wm_news_material
 <div align="center">
     <img src="截图/自媒体文章发布/文章发布-实现思路.png" alt="文章发布-实现思路" />
 </div>
-
 1.前端提交发布或保存为草稿
 
 2.后台判断请求中是否包含了文章id
@@ -2528,3 +2528,265 @@ private void saveOrUpdateWmNews(WmNews wmNews) {
 
 }
 ```
+
+## 十、自媒体文章-自动审核
+
+### 1. 自媒体文章自动审核流程
+
+<div align="center">
+    <img src="截图/自动审核/自动审核流程.png" alt="后台搭建" />
+</div>
+
+1. 自媒体端发布文章后，开始审核文章
+
+2. 审核的主要是审核文章的内容（文本内容和图片）
+
+3. 借助第三方提供的接口审核文本
+
+4. 借助第三方提供的接口审核图片，由于图片存储到minIO中，需要先下载才能审核
+
+5. 如果审核失败，则需要修改自媒体文章的状态，status:2  审核失败    status:3  转到人工审核
+
+6. 如果审核成功，则需要在文章微服务中创建app端需要的文章
+
+### 2. 内容安全第三方接口
+
+&emsp;内容安全是识别服务，支持对图片、视频、文本、语音等对象进行多样化场景检测，有效降低内容违规风险。目前很多平台都支持内容检测，如阿里云、腾讯云、百度AI、网易云等国内大型互联网公司都对外提供了API。
+
+- 文本垃圾内容检测：https://help.aliyun.com/document_detail/70439.html?spm=a2c4g.11186623.6.659.35ac3db3l0wV5k 
+- 文本垃圾内容Java SDK: https://help.aliyun.com/document_detail/53427.html?spm=a2c4g.11186623.6.717.466d7544QbU8Lr 
+- 图片垃圾内容检测：https://help.aliyun.com/document_detail/70292.html?spm=a2c4g.11186623.6.616.5d7d1e7f9vDRz4 
+- 图片垃圾内容Java SDK: https://help.aliyun.com/document_detail/53424.html?spm=a2c4g.11186623.6.715.c8f69b12ey35j4 
+
+### 3. app端文章保存接口
+
+#### 3.1 表结构说明
+
+ap_article  文章基本信息表
+
+```mysql
+-- auto-generated definition
+create table ap_article
+(
+    id           bigint unsigned auto_increment
+        primary key,
+    title        varchar(50)                  null comment '标题',
+    author_id    int unsigned                 null comment '文章作者的ID',
+    author_name  varchar(20)                  null comment '作者昵称',
+    channel_id   int unsigned                 null comment '文章所属频道ID',
+    channel_name varchar(10)                  null comment '频道名称',
+    layout       tinyint unsigned             null comment '文章布局
+            0 无图文章
+            1 单图文章
+            2 多图文章',
+    flag         tinyint unsigned             null comment '文章标记
+            0 普通文章
+            1 热点文章
+            2 置顶文章
+            3 精品文章
+            4 大V 文章',
+    images       varchar(1000)                null comment '文章图片
+            多张逗号分隔',
+    labels       varchar(500)                 null comment '文章标签最多3个 逗号分隔',
+    likes        int unsigned                 null comment '点赞数量',
+    collection   int unsigned                 null comment '收藏数量',
+    comment      int unsigned                 null comment '评论数量',
+    views        int unsigned                 null comment '阅读数量',
+    province_id  int unsigned                 null comment '省市',
+    city_id      int unsigned                 null comment '市区',
+    county_id    int unsigned                 null comment '区县',
+    created_time datetime                     null comment '创建时间',
+    publish_time datetime                     null comment '发布时间',
+    sync_status  tinyint(1)       default 0   null comment '同步状态',
+    origin       tinyint unsigned default '0' null comment '来源',
+    static_url   varchar(150)                 null
+)
+    comment '文章信息表，存储已发布的文章' row_format = DYNAMIC;
+```
+
+ap_article_config  文章配置表
+
+```mysql
+-- auto-generated definition
+create table ap_article_config
+(
+    id         bigint unsigned auto_increment comment '主键'
+        primary key,
+    article_id bigint unsigned  null comment '文章ID',
+    is_comment tinyint unsigned null comment '是否可评论',
+    is_forward tinyint unsigned null comment '是否转发',
+    is_down    tinyint unsigned null comment '是否下架',
+    is_delete  tinyint unsigned null comment '是否已删除'
+)
+    comment 'APP已发布文章配置表' row_format = DYNAMIC;
+
+create index idx_article_id
+    on ap_article_config (article_id);
+```
+
+ap_article_content 文章内容表
+
+```mysql
+-- auto-generated definition
+create table ap_article_content
+(
+    id         bigint unsigned auto_increment comment '主键'
+        primary key,
+    article_id bigint unsigned null comment '文章ID',
+    content    longtext        null comment '文章内容'
+)
+    comment 'APP已发布文章内容表' row_format = DYNAMIC;
+
+create index idx_article_id
+    on ap_article_content (article_id);
+```
+
+三张表关系分析
+
+<div align="center">
+    <img src="截图/文章列表加载/三表关系.png" alt="三表关系" />
+</div>
+
+#### 3.2 分布式id
+
+&emsp;随着业务的增长，文章表可能要占用很大的物理存储空间，为了解决该问题，后期使用数据库分片技术。将一个数据库进行拆分，通过数据库中间件连接。如果数据库中该表选用ID自增策略，则可能产生重复的ID，此时应该使用分布式ID生成策略来生成ID。
+
+<div align="center">
+    <img src="截图/自动审核/分布式id.png" alt="后台搭建" />
+</div>
+
+&emsp;snowflake是Twitter开源的分布式ID生成算法，结果是一个long型的ID。其核心思想是：使用41bit作为毫秒数，10bit作为机器的ID（5个bit是数据中心，5个bit的机器ID），12bit作为毫秒内的流水号（意味着每个节点在每毫秒可以产生 4096 个 ID），最后还有一个符号位，永远是0
+
+<div align="center">
+    <img src="截图/自动审核/雪花算法.png" alt="后台搭建" />
+</div>
+
+文章端相关的表都使用雪花算法生成id,包括ap_article、 ap_article_config、 ap_article_content
+
+#### 3.3 思路分析
+
+在文章审核成功以后需要在app的article库中新增文章数据
+
+1.保存文章信息 ap_article
+
+2.保存文章配置信息 ap_article_config
+
+3.保存文章内容 ap_article_content
+
+实现思路：
+
+<div align="center">
+    <img src="截图/自动审核/文章保存接口.png" alt="后台搭建" />
+</div>
+
+#### 3.4 feign接口
+
+|          | **说明**             |
+| -------- | -------------------- |
+| 接口路径 | /api/v1/article/save |
+| 请求方式 | POST                 |
+| 参数     | ArticleDto           |
+| 响应结果 | ResponseResult       |
+
+ArticleDto
+
+```java
+package com.heima.model.article.dtos;
+
+import com.heima.model.article.pojos.ApArticle;
+import lombok.Data;
+
+@Data
+public class ArticleDto  extends ApArticle {
+    /**
+     * 文章内容
+     */
+    private String content;
+}
+```
+
+成功：
+
+```json
+{
+  "code": 200,
+  "errorMessage" : "操作成功",
+  "data":"1302864436297442242"
+ }
+```
+
+失败：
+
+```json
+{
+  "code":501,
+  "errorMessage":"参数失效",
+ }
+```
+
+```json
+{
+  "code":501,
+  "errorMessage":"文章没有找到",
+ }
+```
+
+#### 3.5 核心代码
+
+```java
+@Autowired
+private ApArticleConfigMapper apArticleConfigMapper;
+
+@Autowired
+private ApArticleContentMapper apArticleContentMapper;
+
+/**
+     * 保存app端相关文章
+     * @param dto
+     * @return
+     */
+@Override
+public ResponseResult saveArticle(ArticleDto dto) {
+    //1.检查参数
+    if(dto == null){
+        return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID);
+    }
+
+    ApArticle apArticle = new ApArticle();
+    BeanUtils.copyProperties(dto,apArticle);
+
+    //2.判断是否存在id
+    if(dto.getId() == null){
+        //2.1 不存在id  保存  文章  文章配置  文章内容
+
+        //保存文章
+        save(apArticle);
+
+        //保存配置
+        ApArticleConfig apArticleConfig = new ApArticleConfig(apArticle.getId());
+        apArticleConfigMapper.insert(apArticleConfig);
+
+        //保存 文章内容
+        ApArticleContent apArticleContent = new ApArticleContent();
+        apArticleContent.setArticleId(apArticle.getId());
+        apArticleContent.setContent(dto.getContent());
+        apArticleContentMapper.insert(apArticleContent);
+
+    }else {
+        //2.2 存在id   修改  文章  文章内容
+
+        //修改  文章
+        updateById(apArticle);
+
+        //修改文章内容
+        ApArticleContent apArticleContent = apArticleContentMapper.selectOne(Wrappers.<ApArticleContent>lambdaQuery().eq(ApArticleContent::getArticleId, dto.getId()));
+        apArticleContent.setContent(dto.getContent());
+        apArticleContentMapper.updateById(apArticleContent);
+    }
+
+
+    //3.结果返回  文章的id
+    return ResponseResult.okResult(apArticle.getId());
+}
+```
+

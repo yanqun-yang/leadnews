@@ -12,7 +12,7 @@ spring:
         file-extension: yml
         shared-configs:
           - data-id: shared-seata.yaml
-logging:
-  level:
-    root: DEBUG
-    com.heima.article: DEBUG
+#logging:
+#  level:
+#    root: DEBUG
+#    com.heima.article: DEBUG
