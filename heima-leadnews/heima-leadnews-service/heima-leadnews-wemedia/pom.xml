@@ -23,11 +23,12 @@
             <artifactId>heima-file-starter</artifactId>
             <version>1.0-SNAPSHOT</version>
         </dependency>
+<!--TODO: 实现自媒体端远程调用文章微服务保存过程的全局事务-->
         <!--seata-->
-        <dependency>
+        <!--<dependency>
             <groupId>com.alibaba.cloud</groupId>
             <artifactId>spring-cloud-starter-alibaba-seata</artifactId>
-        </dependency>
+        </dependency>-->
     </dependencies>
 
 </project>

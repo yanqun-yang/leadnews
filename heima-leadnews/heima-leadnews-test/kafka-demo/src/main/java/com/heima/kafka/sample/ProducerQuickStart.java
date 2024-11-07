@@ -28,7 +28,10 @@ public class ProducerQuickStart {
          * 第二个参数：消息的key
          * 第三个参数：消息的value
          */
-        ProducerRecord<String, String> kvProducerRecord = new ProducerRecord<String, String>("topic-first", "key-001", "hello kafka");
+        ProducerRecord<String, String> kvProducerRecord = new ProducerRecord<String, String>("itcast-topic-input", "key-001", "hello kafka");
+        producer.send(kvProducerRecord);
+        kvProducerRecord = new ProducerRecord("itcast-topic-input", "key-002", "hello itcast");
+        producer.send(kvProducerRecord);
         //同步发送消息 -- 大量数据可能阻塞
 //        RecordMetadata recordMetadata = null;
 //        try {

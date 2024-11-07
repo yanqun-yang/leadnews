@@ -89,7 +89,16 @@
 
 ### 1. 项目概述
 
-&emsp;类似于今日头条/腾讯新闻，是一个新闻资讯类项目。随着智能手机的普及，人们更加习惯于通过手机来看新闻。由于生活节奏的加快，很多人只能利用碎片时间来获取信息，因此，对于移动资讯客户端的需求也越来越高。头条项目采用当下火热的微服务+大数据技术架构实现。本项目主要着手于获取最新最热新闻资讯，通过大数据分析用户喜好精确推送咨询新闻
+&emsp;类似于今日头条/腾讯新闻，是一个新闻资讯类项目。随着智能手机的普及，人们更加习惯于通过手机来看新闻。由于生活节奏的加快，很多人只能利用碎片时间来获取信息，因此，对于移动资讯客户端的需求也越来越高。头条项目采用当下火热的微服务+大数据技术架构实现。本项目主要着手于获取最新最热新闻资讯，通过大数据分析用户喜好精确推送咨询新闻。
+
+&emsp;本系统分为普通用户、作者、管理员三种角色
+
+- 普通用户：注册登录 浏览文章 关注 点赞 喜欢 评论 回复评论 点赞评论 搜索文章 搜索历史记录
+- 作者：拥有普通用户所有功能 图片素材管理 发布文章 上下架文章
+
+- 管理员：用户列表 用户申请成为作者列表 审核 频道管理（文章类型管理）文章管理审核 敏感词管理
+
+文章发布还接入了阿里云文字和图片识别，内容安全涉黄涉黑检测
 
 ### 2. 功能架构图
 
@@ -2652,7 +2661,7 @@ create index idx_article_id
 &emsp;随着业务的增长，文章表可能要占用很大的物理存储空间，为了解决该问题，后期使用数据库分片技术。将一个数据库进行拆分，通过数据库中间件连接。如果数据库中该表选用ID自增策略，则可能产生重复的ID，此时应该使用分布式ID生成策略来生成ID。
 
 <div align="center">
-    <img src="截图/自动审核/分布式id.png" alt="后台搭建" />
+    <img src="截图/自动审核/分布式id.png" alt="分布式id" />
 </div>
 
 &emsp;snowflake是Twitter开源的分布式ID生成算法，结果是一个long型的ID。其核心思想是：使用41bit作为毫秒数，10bit作为机器的ID（5个bit是数据中心，5个bit的机器ID），12bit作为毫秒内的流水号（意味着每个节点在每毫秒可以产生 4096 个 ID），最后还有一个符号位，永远是0
@@ -2790,3 +2799,1540 @@ public ResponseResult saveArticle(ArticleDto dto) {
 }
 ```
 
+### 4. 自媒体文章自动审核功能实现
+
+#### 4.1 表结构说明
+
+wm_news 自媒体文章表
+
+```mysql
+-- auto-generated definition
+create table wm_news
+(
+    id            int auto_increment comment '主键'
+        primary key,
+    user_id       int unsigned                 null comment '自媒体用户ID',
+    title         varchar(36)                  null comment '标题',
+    content       longtext                     null comment '图文内容',
+    type          tinyint unsigned             null comment '文章布局
+            0 无图文章
+            1 单图文章
+            3 多图文章',
+    channel_id    int unsigned                 null comment '图文频道ID',
+    labels        varchar(20)                  null,
+    created_time  datetime                     null comment '创建时间',
+    submited_time datetime                     null comment '提交时间',
+    status        tinyint unsigned             null comment '当前状态
+            0 草稿
+            1 提交（待审核）
+            2 审核失败
+            3 人工审核
+            4 人工审核通过
+            8 审核通过（待发布）
+            9 已发布',
+    publish_time  datetime                     null comment '定时发布时间，不定时则为空',
+    reason        varchar(50)                  null comment '拒绝理由',
+    article_id    bigint unsigned              null comment '发布库文章ID',
+    images        longtext                     null comment '//图片用逗号分隔',
+    enable        tinyint unsigned default '1' null
+)
+    comment '自媒体图文内容信息表' collate = utf8mb4_unicode_ci
+                                   row_format = DYNAMIC;
+```
+
+status字段：0 草稿  1 待审核  2 审核失败  3 人工审核  4 人工审核通过  8 审核通过（待发布） 9 已发布
+
+#### 4.2 核心代码
+
+```java
+@Service
+@Slf4j
+@Transactional
+public class WmNewsAutoScanServiceImpl implements WmNewsAutoScanService {
+
+    @Autowired
+    private WmNewsMapper wmNewsMapper;
+
+    /**
+     * 自媒体文章审核
+     *
+     * @param id 自媒体文章id
+     */
+    @Override
+    public void autoScanWmNews(Integer id) {
+        //1.查询自媒体文章
+        WmNews wmNews = wmNewsMapper.selectById(id);
+        if(wmNews == null){
+            throw new RuntimeException("WmNewsAutoScanServiceImpl-文章不存在");
+        }
+
+        if(wmNews.getStatus().equals(WmNews.Status.SUBMIT.getCode())){
+            //从内容中提取纯文本内容和图片
+            Map<String,Object> textAndImages = handleTextAndImages(wmNews);
+
+            //2.审核文本内容  阿里云接口
+            boolean isTextScan = handleTextScan((String) textAndImages.get("content"),wmNews);
+            if(!isTextScan)return;
+
+            //3.审核图片  阿里云接口
+            boolean isImageScan =  handleImageScan((List<String>) textAndImages.get("images"),wmNews);
+            if(!isImageScan)return;
+
+            //4.审核成功，保存app端的相关的文章数据
+            ResponseResult responseResult = saveAppArticle(wmNews);
+            if(!responseResult.getCode().equals(200)){
+                throw new RuntimeException("WmNewsAutoScanServiceImpl-文章审核，保存app端相关文章数据失败");
+            }
+            //回填article_id
+            wmNews.setArticleId((Long) responseResult.getData());
+            updateWmNews(wmNews,(short) 9,"审核成功");
+
+        }
+    }
+
+    @Autowired
+    private IArticleClient articleClient;
+
+    @Autowired
+    private WmChannelMapper wmChannelMapper;
+
+    @Autowired
+    private WmUserMapper wmUserMapper;
+
+    /**
+     * 保存app端相关的文章数据
+     * @param wmNews
+     */
+    private ResponseResult saveAppArticle(WmNews wmNews) {
+
+        ArticleDto dto = new ArticleDto();
+        //属性的拷贝
+        BeanUtils.copyProperties(wmNews,dto);
+        //文章的布局
+        dto.setLayout(wmNews.getType());
+        //频道
+        WmChannel wmChannel = wmChannelMapper.selectById(wmNews.getChannelId());
+        if(wmChannel != null){
+            dto.setChannelName(wmChannel.getName());
+        }
+
+        //作者
+        dto.setAuthorId(wmNews.getUserId().longValue());
+        WmUser wmUser = wmUserMapper.selectById(wmNews.getUserId());
+        if(wmUser != null){
+            dto.setAuthorName(wmUser.getName());
+        }
+
+        //设置文章id
+        if(wmNews.getArticleId() != null){
+            dto.setId(wmNews.getArticleId());
+        }
+        dto.setCreatedTime(new Date());
+
+        ResponseResult responseResult = articleClient.saveArticle(dto);
+        return responseResult;
+
+    }
+
+
+    @Autowired
+    private FileStorageService fileStorageService;
+
+    @Autowired
+    private GreenImageScan greenImageScan;
+
+    /**
+     * 审核图片
+     * @param images
+     * @param wmNews
+     * @return
+     */
+    private boolean handleImageScan(List<String> images, WmNews wmNews) {
+
+        boolean flag = true;
+
+        if(images == null || images.size() == 0){
+            return flag;
+        }
+
+        //下载图片 minIO
+        //图片去重
+        images = images.stream().distinct().collect(Collectors.toList());
+
+        List<byte[]> imageList = new ArrayList<>();
+
+        for (String image : images) {
+            byte[] bytes = fileStorageService.downLoadFile(image);
+            imageList.add(bytes);
+        }
+
+
+        //审核图片
+        try {
+            Map map = greenImageScan.imageScan(imageList);
+            if(map != null){
+                //审核失败
+                if(map.get("suggestion").equals("block")){
+                    flag = false;
+                    updateWmNews(wmNews, (short) 2, "当前文章中存在违规内容");
+                }
+
+                //不确定信息  需要人工审核
+                if(map.get("suggestion").equals("review")){
+                    flag = false;
+                    updateWmNews(wmNews, (short) 3, "当前文章中存在不确定内容");
+                }
+            }
+
+        } catch (Exception e) {
+            flag = false;
+            e.printStackTrace();
+        }
+        return flag;
+    }
+
+    @Autowired
+    private GreenTextScan greenTextScan;
+
+    /**
+     * 审核纯文本内容
+     * @param content
+     * @param wmNews
+     * @return
+     */
+    private boolean handleTextScan(String content, WmNews wmNews) {
+
+        boolean flag = true;
+
+        if((wmNews.getTitle()+"-"+content).length() == 0){
+            return flag;
+        }
+
+        try {
+            Map map = greenTextScan.greeTextScan((wmNews.getTitle()+"-"+content));
+            if(map != null){
+                //审核失败
+                if(map.get("suggestion").equals("block")){
+                    flag = false;
+                    updateWmNews(wmNews, (short) 2, "当前文章中存在违规内容");
+                }
+
+                //不确定信息  需要人工审核
+                if(map.get("suggestion").equals("review")){
+                    flag = false;
+                    updateWmNews(wmNews, (short) 3, "当前文章中存在不确定内容");
+                }
+            }
+        } catch (Exception e) {
+            flag = false;
+            e.printStackTrace();
+        }
+
+        return flag;
+
+    }
+
+    /**
+     * 修改文章内容
+     * @param wmNews
+     * @param status
+     * @param reason
+     */
+    private void updateWmNews(WmNews wmNews, short status, String reason) {
+        wmNews.setStatus(status);
+        wmNews.setReason(reason);
+        wmNewsMapper.updateById(wmNews);
+    }
+
+    /**
+     * 1。从自媒体文章的内容中提取文本和图片
+     * 2.提取文章的封面图片
+     * @param wmNews
+     * @return
+     */
+    private Map<String, Object> handleTextAndImages(WmNews wmNews) {
+
+        //存储纯文本内容
+        StringBuilder stringBuilder = new StringBuilder();
+
+        List<String> images = new ArrayList<>();
+
+        //1。从自媒体文章的内容中提取文本和图片
+        if(StringUtils.isNotBlank(wmNews.getContent())){
+            List<Map> maps = JSONArray.parseArray(wmNews.getContent(), Map.class);
+            for (Map map : maps) {
+                if (map.get("type").equals("text")){
+                    stringBuilder.append(map.get("value"));
+                }
+
+                if (map.get("type").equals("image")){
+                    images.add((String) map.get("value"));
+                }
+            }
+        }
+        //2.提取文章的封面图片
+        if(StringUtils.isNotBlank(wmNews.getImages())){
+            String[] split = wmNews.getImages().split(",");
+            images.addAll(Arrays.asList(split));
+        }
+
+        Map<String, Object> resultMap = new HashMap<>();
+        resultMap.put("content",stringBuilder.toString());
+        resultMap.put("images",images);
+        return resultMap;
+
+    }
+}
+```
+
+#### 4.3 feign远程接口调用方式
+
+<div align="center">
+    <img src="截图/自动审核/Feign远程接口调用.png" alt="Feign远程接口调用" />
+</div>
+
+在heima-leadnews-wemedia服务中已经依赖了heima-leadnews-feign-apis工程，只需要在自媒体的引导类中开启feign的远程调用即可
+
+注解为：`@EnableFeignClients(basePackages = "com.heima.apis")` 需要指向apis这个包
+
+#### 4.4 服务降级处理
+
+- 服务降级是服务自我保护的一种方式，或者保护下游服务的一种方式，用于确保服务不会受请求突增影响变得不可用，确保服务不会崩溃
+
+- 服务降级虽然会导致请求失败，但是不会导致阻塞。
+
+##### 4.4.1 降级逻辑
+
+①：在自媒体微服务中添加类，扫描降级代码类的包	
+
+```java
+@Component
+public class IArticleClientFallback implements IArticleClient {
+    @Override
+    public ResponseResult saveArticle(ArticleDto dto)  {
+        return ResponseResult.errorResult(AppHttpCodeEnum.SERVER_ERROR,"获取数据失败");
+    }
+}
+```
+
+在自媒体微服务中添加类，扫描降级代码类的包
+
+```java
+@Configuration
+@ComponentScan("com.heima.apis.article.fallback")
+public class InitConfig {
+}
+```
+
+②：远程接口中指向降级代码
+
+```java
+@FeignClient(value = "leadnews-article",fallback = IArticleClientFallback.class)
+public interface IArticleClient {
+
+    @PostMapping("/api/v1/article/save")
+    public ResponseResult saveArticle(@RequestBody ArticleDto dto);
+}
+```
+
+③：客户端开启降级heima-leadnews-wemedia
+
+在wemedia的nacos配置中心里添加如下内容，开启服务降级，也可以指定服务响应的超时的时间
+
+```yaml
+feign:
+  # 开启feign对hystrix熔断降级的支持
+  hystrix:
+    enabled: true
+  # 修改调用超时时间
+  client:
+    config:
+      default:
+        connectTimeout: 2000
+        readTimeout: 2000
+        
+# 增加Hystrix超时时间配置
+hystrix:
+  command:
+    default:
+      execution:
+        isolation:
+          thread:
+            timeoutInMilliseconds: 20000   # 将Hystrix超时设置为20秒
+```
+
+### 5. 发布文章提交审核集成
+
+#### 5.1 同步调用与异步调用
+
+同步：就是在发出一个调用时，在没有得到结果之前， 该调用就不返回（实时处理）
+
+异步：调用在发出之后，这个调用就直接返回了，没有返回结果（分时处理）
+
+<div align="center">
+    <img src="截图/自动审核/异步审核.png" alt="异步审核" />
+</div>
+
+异步线程的方式审核文章
+
+#### 5.2 Springboot集成异步线程调用
+
+①：在自动审核的方法上加上@Async注解（标明要异步调用）
+
+```java
+@Override
+@Async  //标明当前方法是一个异步方法
+public void autoScanWmNews(Integer id) {
+	//代码略
+}
+```
+
+②：在文章发布成功后调用审核的方法
+
+```java
+@Autowired
+private WmNewsAutoScanService wmNewsAutoScanService;
+
+/**
+ * 发布修改文章或保存为草稿
+ * @param dto
+ * @return
+ */
+@Override
+public ResponseResult submitNews(WmNewsDto dto) {
+
+    //代码略
+
+    //审核文章
+    wmNewsAutoScanService.autoScanWmNews(wmNews.getId());
+
+    return ResponseResult.okResult(AppHttpCodeEnum.SUCCESS);
+
+}
+```
+
+③：在自媒体引导类中使用@EnableAsync注解开启异步调用
+
+```java
+@SpringBootApplication
+@EnableDiscoveryClient
+@MapperScan("com.heima.wemedia.mapper")
+@EnableFeignClients(basePackages = "com.heima.apis")
+@EnableAsync  //开启异步调用
+public class WemediaApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(WemediaApplication.class,args);
+    }
+
+    @Bean
+    public MybatisPlusInterceptor mybatisPlusInterceptor() {
+        MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+        interceptor.addInnerInterceptor(new PaginationInnerInterceptor(DbType.MYSQL));
+        return interceptor;
+    }
+}
+```
+
+### 6. 新需求-自管理敏感词
+
+#### 6.1 需求分析
+
+- 文章审核不能过滤一些敏感词：
+
+  私人侦探、针孔摄象、信用卡提现、广告代理、代开发票、刻章办、出售答案、小额贷款…
+
+需要完成的功能：
+
+需要自己维护一套敏感词，在文章审核的时候，需要验证文章是否包含这些敏感词
+
+#### 6.2 敏感词-过滤
+
+技术选型
+
+| **方案**               | **说明**                     |
+| ---------------------- | ---------------------------- |
+| 数据库模糊查询         | 效率太低                     |
+| String.indexOf("")查找 | 数据库量大的话也是比较慢     |
+| 全文检索               | 分词再匹配                   |
+| DFA算法                | 确定有穷自动机(一种数据结构) |
+
+#### 6.3 DFA实现原理
+
+DFA全称为：Deterministic Finite Automaton,即确定有穷自动机。
+
+存储：一次性的把所有的敏感词存储到了多个map中，就是下图表示这种结构
+
+敏感词：冰毒、大麻、大坏蛋
+
+<div align="center">
+    <img src="截图/自动审核/DFA.png" alt="DFA" />
+</div>
+
+检索的过程
+
+<div align="center">
+    <img src="截图/自动审核/检索过程.png" alt="检索过程" />
+</div>
+
+#### 6.4 自管理敏感词集成到文章审核中
+
+创建敏感词表，wm_sensitive
+
+```mysql
+-- auto-generated definition
+create table wm_sensitive
+(
+    id           int unsigned auto_increment comment '主键'
+        primary key,
+    sensitives   varchar(10) null comment '敏感词',
+    created_time datetime    null comment '创建时间'
+)
+    comment '敏感词信息表' collate = utf8mb4_unicode_ci
+                           row_format = DYNAMIC;
+```
+
+##### 6.4.1 核心代码
+
+```java
+@Autowired
+private WmSensitiveMapper wmSensitiveMapper;
+
+/**
+     * 自管理的敏感词审核
+     * @param content
+     * @param wmNews
+     * @return
+     */
+private boolean handleSensitiveScan(String content, WmNews wmNews) {
+
+    boolean flag = true;
+
+    //获取所有的敏感词
+    List<WmSensitive> wmSensitives = wmSensitiveMapper.selectList(Wrappers.<WmSensitive>lambdaQuery().select(WmSensitive::getSensitives));
+    List<String> sensitiveList = wmSensitives.stream().map(WmSensitive::getSensitives).collect(Collectors.toList());
+
+    //初始化敏感词库
+    SensitiveWordUtil.initMap(sensitiveList);
+
+    //查看文章中是否包含敏感词
+    Map<String, Integer> map = SensitiveWordUtil.matchWords(content);
+    if(map.size() >0){
+        updateWmNews(wmNews,(short) 2,"当前文章中存在违规内容"+map);
+        flag = false;
+    }
+
+    return flag;
+}
+```
+
+
+
+SensitiveWordUtil
+
+```java
+public class SensitiveWordUtil {
+
+    public static Map<String, Object> dictionaryMap = new HashMap<>();
+
+    /**
+     * 生成关键词字典库
+     * @param words
+     * @return
+     */
+    public static void initMap(Collection<String> words) {
+        if (words == null) {
+            System.out.println("敏感词列表不能为空");
+            return ;
+        }
+
+        // map初始长度words.size()，整个字典库的入口字数(小于words.size()，因为不同的词可能会有相同的首字)
+        Map<String, Object> map = new HashMap<>(words.size());
+        // 遍历过程中当前层次的数据
+        Map<String, Object> curMap = null;
+        Iterator<String> iterator = words.iterator();
+
+        while (iterator.hasNext()) {
+            String word = iterator.next();
+            curMap = map;
+            int len = word.length();
+            for (int i =0; i < len; i++) {
+                // 遍历每个词的字
+                String key = String.valueOf(word.charAt(i));
+                // 当前字在当前层是否存在, 不存在则新建, 当前层数据指向下一个节点, 继续判断是否存在数据
+                Map<String, Object> wordMap = (Map<String, Object>) curMap.get(key);
+                if (wordMap == null) {
+                    // 每个节点存在两个数据: 下一个节点和isEnd(是否结束标志)
+                    wordMap = new HashMap<>(2);
+                    wordMap.put("isEnd", "0");
+                    curMap.put(key, wordMap);
+                }
+                curMap = wordMap;
+                // 如果当前字是词的最后一个字，则将isEnd标志置1
+                if (i == len -1) {
+                    curMap.put("isEnd", "1");
+                }
+            }
+        }
+
+        dictionaryMap = map;
+    }
+
+    /**
+     * 搜索文本中某个文字是否匹配关键词
+     * @param text
+     * @param beginIndex
+     * @return
+     */
+    private static int checkWord(String text, int beginIndex) {
+        if (dictionaryMap == null) {
+            throw new RuntimeException("字典不能为空");
+        }
+        boolean isEnd = false;
+        int wordLength = 0;
+        Map<String, Object> curMap = dictionaryMap;
+        int len = text.length();
+        // 从文本的第beginIndex开始匹配
+        for (int i = beginIndex; i < len; i++) {
+            String key = String.valueOf(text.charAt(i));
+            // 获取当前key的下一个节点
+            curMap = (Map<String, Object>) curMap.get(key);
+            if (curMap == null) {
+                break;
+            } else {
+                wordLength ++;
+                if ("1".equals(curMap.get("isEnd"))) {
+                    isEnd = true;
+                }
+            }
+        }
+        if (!isEnd) {
+            wordLength = 0;
+        }
+        return wordLength;
+    }
+
+    /**
+     * 获取匹配的关键词和命中次数
+     * @param text
+     * @return
+     */
+    public static Map<String, Integer> matchWords(String text) {
+        Map<String, Integer> wordMap = new HashMap<>();
+        int len = text.length();
+        for (int i = 0; i < len; i++) {
+            int wordLength = checkWord(text, i);
+            if (wordLength > 0) {
+                String word = text.substring(i, i + wordLength);
+                // 添加关键词匹配次数
+                if (wordMap.containsKey(word)) {
+                    wordMap.put(word, wordMap.get(word) + 1);
+                } else {
+                    wordMap.put(word, 1);
+                }
+
+                i += wordLength - 1;
+            }
+        }
+        return wordMap;
+    }
+}
+```
+
+### 7. 新需求-图片识别文字审核敏感词
+
+#### 7.1 需求分析
+
+文章中包含的图片要识别文字，过滤掉图片文字的敏感词
+
+<div align="center">
+    <img src="截图/自动审核/图片识别文字.png" alt="图片识别文字" />
+</div>
+
+#### 7.2 图片文字识别
+
+&emsp;OCR （Optical Character Recognition，光学字符识别）是指电子设备（例如扫描仪或数码相机）检查纸上打印的字符，通过检测暗、亮的模式确定其形状，然后用字符识别方法将形状翻译成计算机文字的过程
+
+| **方案**      | **说明**                                            |
+| ------------- | --------------------------------------------------- |
+| 百度OCR       | 收费                                                |
+| Tesseract-OCR | Google维护的开源OCR引擎，支持Java，Python等语言调用 |
+| Tess4J        | 封装了Tesseract-OCR  ，支持Java调用                 |
+
+#### 7.3 Tess4j案例
+
+```java
+@Getter
+@Setter
+@Component
+@ConfigurationProperties(prefix = "tess4j")
+public class Tess4jClient {
+
+    private String dataPath;
+    private String language;
+
+    public String doOCR(BufferedImage image) throws TesseractException {
+        //创建Tesseract对象
+        ITesseract tesseract = new Tesseract();
+        //设置字体库路径
+        tesseract.setDatapath(dataPath);
+        //中文识别
+        tesseract.setLanguage(language);
+        //执行ocr识别
+        String result = tesseract.doOCR(image);
+        //替换回车和tal键  使结果为一行
+        result = result.replaceAll("\\r|\\n", "-").replaceAll(" ", "");
+        return result;
+    }
+
+}
+```
+
+配置中添加属性
+
+```yaml
+tess4j:
+  data-path: D:\workspace\tessdata
+  language: chi_sim	
+```
+
+在WmNewsAutoScanServiceImpl中的handleImageScan方法上添加如下代码
+
+```java
+try {
+    for (String image : images) {
+        byte[] bytes = fileStorageService.downLoadFile(image);
+
+        //图片识别文字审核---begin-----
+
+        //从byte[]转换为butteredImage
+        ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+        BufferedImage imageFile = ImageIO.read(in);
+        //识别图片的文字
+        String result = tess4jClient.doOCR(imageFile);
+
+        //审核是否包含自管理的敏感词
+        boolean isSensitive = handleSensitiveScan(result, wmNews);
+        if(!isSensitive){
+            return isSensitive;
+        }
+
+        //图片识别文字审核---end-----
+
+        imageList.add(bytes);
+    } 
+}catch (Exception e){
+    e.printStackTrace();
+}
+```
+
+### 8. 文章详情-静态文件生成
+
+#### 8.1 思路分析
+
+文章端创建app相关文章时，生成文章详情静态页上传到MinIO中
+
+<div align="center">
+    <img src="截图/自动审核/静态文件生成.png" alt="静态文件生成" />
+</div>
+
+核心代码
+
+```java
+@Service
+@Slf4j
+@Transactional
+public class ArticleFreemarkerServiceImpl implements ArticleFreemarkerService {
+
+    @Autowired
+    private ApArticleContentMapper apArticleContentMapper;
+
+    @Autowired
+    private Configuration configuration;
+
+    @Autowired
+    private FileStorageService fileStorageService;
+
+    @Autowired
+    private ApArticleService apArticleService;
+
+    /**
+     * 生成静态文件上传到minIO中
+     * @param apArticle
+     * @param content
+     */
+    @Async
+    @Override
+    public void buildArticleToMinIO(ApArticle apArticle, String content) {
+        //已知文章的id
+        //4.1 获取文章内容
+        if(StringUtils.isNotBlank(content)){
+            //4.2 文章内容通过freemarker生成html文件
+            Template template = null;
+            StringWriter out = new StringWriter();
+            try {
+                template = configuration.getTemplate("article.ftl");
+                //数据模型
+                Map<String,Object> contentDataModel = new HashMap<>();
+                contentDataModel.put("content", JSONArray.parseArray(content));
+                //合成
+                template.process(contentDataModel,out);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+
+            //4.3 把html文件上传到minio中
+            InputStream in = new ByteArrayInputStream(out.toString().getBytes());
+            String path = fileStorageService.uploadHtmlFile("", apArticle.getId() + ".html", in);
+
+            //4.4 修改ap_article表，保存static_url字段
+            apArticleService.update(Wrappers.<ApArticle>lambdaUpdate().eq(ApArticle::getId,apArticle.getId())
+                    .set(ApArticle::getStaticUrl,path));
+
+        }
+    }
+}
+```
+
+在ApArticleService的saveArticle实现方法中添加异步调用生成文件的方法
+
+文章微服务启动类上开启异步调用`@EnableAsync`
+
+## 十一、延迟任务精准发布文章
+
+### 1. 概述
+
+#### 1.1 什么是延迟任务
+
+- 定时任务：有固定周期的，有明确的触发时间
+- 延迟队列：没有固定的开始时间，它常常是由一个事件触发的，而在这个事件触发之后的一段时间内触发另一个事件，任务可以立即执行，也可以延迟
+
+<div align="center">
+    <img src="截图/延迟任务/概述.png" alt="概述" />
+</div>
+
+应用场景：
+
+场景一：订单下单之后30分钟后，如果用户没有付钱，则系统自动取消订单；如果期间下单成功，任务取消
+
+场景二：接口对接出现网络问题，1分钟后重试，如果失败，2分钟重试，直到出现阈值终止
+
+#### 2.2 技术对比
+
+##### 2.2.1 DelayQueue
+
+JDK自带DelayQueue 是一个支持延时获取元素的阻塞队列， 内部采用优先队列 PriorityQueue 存储元素，同时元素必须实现 Delayed 接口；在创建元素时可以指定多久才可以从队列中获取当前元素，只有在延迟期满时才能从队列中提取元素
+
+<div align="center">
+    <img src="截图/延迟任务/DelayQueue.png" alt="DelayQueue" />
+</div>
+
+DelayQueue属于排序队列，它的特殊之处在于队列的元素必须实现Delayed接口，该接口需要实现compareTo和getDelay方法
+
+getDelay方法：获取元素在队列中的剩余时间，只有当剩余时间为0时元素才可以出队列。
+
+compareTo方法：用于排序，确定元素出队列的顺序。
+
+###### DelayQueue问题-未持久化
+
+使用线程池或者原生DelayQueue程序挂掉之后，**任务都是放在内存**，需要考虑未处理消息的丢失带来的影响，如何保证数据不丢失，需要**持久化（磁盘）**。
+
+##### 2.2.2 RabbitMQ实现延迟任务
+
+- TTL：Time To Live (消息存活时间)
+
+- 死信队列：Dead Letter Exchange(死信交换机)，当消息成为Dead message后，可以重新发送另一个交换机（死信交换机）
+
+<div align="center">
+    <img src="截图/延迟任务/RabbitMQ.png" alt="RabbitMQ" />
+</div>
+
+##### 2.2.3 redis实现
+
+zset数据类型的去重有序（分数排序）特点进行延迟。例如：时间戳作为score进行排序
+
+<div align="center">
+    <img src="截图/延迟任务/redis.png" alt="redis" />
+</div>
+
+### 2. redis实现延迟任务
+
+<div align="center">
+    <img src="截图/延迟任务/实现思路.png" alt="实现思路" />
+</div>
+
+问题思路
+
+1.为什么任务需要存储在数据库中？
+
+延迟任务是一个通用的服务，任何需要延迟得任务都可以调用该服务，需要考虑数据持久化的问题，存储数据库中是一种数据安全的考虑。
+
+2.为什么redis中使用两种数据类型，list和zset？
+
+效率问题，算法的时间复杂度
+
+3.在添加zset数据的时候，为什么不需要预加载？
+
+任务模块是一个通用的模块，项目中任何需要延迟队列的地方，都可以调用这个接口，要考虑到数据量的问题，如果数据量特别大，为了防止阻塞，只需要把未来几分钟要执行的数据存入缓存即可。
+
+### 3. 延迟任务服务实现
+
+#### 3.1 表结构
+
+taskinfo 任务表
+
+```mysql
+-- auto-generated definition
+create table taskinfo
+(
+    task_id      bigint      not null comment '任务id'
+        primary key,
+    execute_time datetime(3) not null comment '执行时间',
+    parameters   longblob    null comment '参数',
+    priority     int         not null comment '优先级',
+    task_type    int         not null comment '任务类型'
+)
+    charset = utf8mb3;
+
+create index index_taskinfo_time
+    on taskinfo (task_type, priority, execute_time);
+```
+
+taskinfo_logs 任务日志表
+
+```mysql
+-- auto-generated definition
+create table taskinfo_logs
+(
+    task_id      bigint        not null comment '任务id'
+        primary key,
+    execute_time datetime(3)   not null comment '执行时间',
+    parameters   longblob      null comment '参数',
+    priority     int           not null comment '优先级',
+    task_type    int           not null comment '任务类型',
+    version      int           not null comment '版本号,用乐观锁',
+    status       int default 0 null comment '状态 0=初始化状态 1=EXECUTED 2=CANCELLED'
+)
+    charset = utf8mb3;
+```
+
+乐观锁支持：
+
+```java
+/**
+     * mybatis-plus乐观锁支持
+     * @return
+     */
+@Bean
+public MybatisPlusInterceptor optimisticLockerInterceptor(){
+    MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+    interceptor.addInnerInterceptor(new OptimisticLockerInnerInterceptor());
+    return interceptor;
+}
+```
+
+#### 3.2 添加任务
+
+ScheduleConstants常量类
+
+```java
+public class ScheduleConstants {
+    
+    //task状态
+    public static final int SCHEDULED=0;   //初始化状态
+
+    public static final int EXECUTED=1;       //已执行状态
+
+    public static final int CANCELLED=2;   //已取消状态
+
+    public static String FUTURE="future_";   //未来数据key前缀
+
+    public static String TOPIC="topic_";     //当前数据key前缀
+}
+```
+
+##### 3.2.1 核心代码
+
+```java
+@Service
+@Transactional
+@Slf4j
+public class TaskServiceImpl implements TaskService {
+    /**
+     * 添加延迟任务
+     *
+     * @param task
+     * @return
+     */
+    @Override
+    public long addTask(Task task) {
+        //1.添加任务到数据库中
+
+        boolean success = addTaskToDb(task);
+
+        if (success) {
+            //2.添加任务到redis
+            addTaskToCache(task);
+        }
+
+        return task.getTaskId();
+    }
+
+    @Autowired
+    private CacheService cacheService;
+
+    /**
+     * 把任务添加到redis中
+     *
+     * @param task
+     */
+    private void addTaskToCache(Task task) {
+
+        String key = task.getTaskType() + "_" + task.getPriority();
+
+        //获取5分钟之后的时间  毫秒值
+        Calendar calendar = Calendar.getInstance();
+        calendar.add(Calendar.MINUTE, 5);
+        long nextScheduleTime = calendar.getTimeInMillis();
+
+        //2.1 如果任务的执行时间小于等于当前时间，存入list
+        if (task.getExecuteTime() <= System.currentTimeMillis()) {
+            cacheService.lLeftPush(ScheduleConstants.TOPIC + key, JSON.toJSONString(task));
+        } else if (task.getExecuteTime() <= nextScheduleTime) {
+            //2.2 如果任务的执行时间大于当前时间 && 小于等于预设时间（未来5分钟） 存入zset中
+            cacheService.zAdd(ScheduleConstants.FUTURE + key, JSON.toJSONString(task), task.getExecuteTime());
+        }
+
+    }
+
+    @Autowired
+    private TaskinfoMapper taskinfoMapper;
+
+    @Autowired
+    private TaskinfoLogsMapper taskinfoLogsMapper;
+
+    /**
+     * 添加任务到数据库中
+     *
+     * @param task
+     * @return
+     */
+    private boolean addTaskToDb(Task task) {
+
+        boolean flag = false;
+
+        try {
+            //保存任务表
+            Taskinfo taskinfo = new Taskinfo();
+            BeanUtils.copyProperties(task, taskinfo);
+            taskinfo.setExecuteTime(new Date(task.getExecuteTime()));
+            taskinfoMapper.insert(taskinfo);
+
+            //设置taskID
+            task.setTaskId(taskinfo.getTaskId());
+
+            //保存任务日志数据
+            TaskinfoLogs taskinfoLogs = new TaskinfoLogs();
+            BeanUtils.copyProperties(taskinfo, taskinfoLogs);
+            taskinfoLogs.setVersion(1);
+            taskinfoLogs.setStatus(ScheduleConstants.SCHEDULED);
+            taskinfoLogsMapper.insert(taskinfoLogs);
+
+            flag = true;
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        return flag;
+    }
+}
+```
+
+#### 3.3 取消任务
+
+##### 3.3.1 核心代码
+
+```java
+/**
+     * 取消任务
+     * @param taskId
+     * @return
+     */
+@Override
+public boolean cancelTask(long taskId) {
+
+    boolean flag = false;
+
+    //删除任务，更新日志
+    Task task = updateDb(taskId,ScheduleConstants.EXECUTED);
+
+    //删除redis的数据
+    if(task != null){
+        removeTaskFromCache(task);
+        flag = true;
+    }
+
+    return false;
+}
+
+/**
+     * 删除redis中的任务数据
+     * @param task
+     */
+private void removeTaskFromCache(Task task) {
+
+    String key = task.getTaskType()+"_"+task.getPriority();
+
+    if(task.getExecuteTime()<=System.currentTimeMillis()){
+        cacheService.lRemove(ScheduleConstants.TOPIC+key,0,JSON.toJSONString(task));
+    }else {
+        cacheService.zRemove(ScheduleConstants.FUTURE+key, JSON.toJSONString(task));
+    }
+}
+
+/**
+     * 删除任务，更新任务日志状态
+     * @param taskId
+     * @param status
+     * @return
+     */
+private Task updateDb(long taskId, int status) {
+    Task task = null;
+    try {
+        //删除任务
+        taskinfoMapper.deleteById(taskId);
+
+        TaskinfoLogs taskinfoLogs = taskinfoLogsMapper.selectById(taskId);
+        taskinfoLogs.setStatus(status);
+        taskinfoLogsMapper.updateById(taskinfoLogs);
+
+        task = new Task();
+        BeanUtils.copyProperties(taskinfoLogs,task);
+        task.setExecuteTime(taskinfoLogs.getExecuteTime().getTime());
+    }catch (Exception e){
+        log.error("task cancel exception taskid={}",taskId);
+    }
+
+    return task;
+
+}
+```
+
+#### 3.4 消费任务
+
+##### 3.4.1 核心代码
+
+```java
+/**
+     * 按照类型和优先级拉取任务
+     * @return
+     */
+@Override
+public Task poll(int type,int priority) {
+    Task task = null;
+    try {
+        String key = type+"_"+priority;
+        String task_json = cacheService.lRightPop(ScheduleConstants.TOPIC + key);
+        if(StringUtils.isNotBlank(task_json)){
+            task = JSON.parseObject(task_json, Task.class);
+            //更新数据库信息
+            updateDb(task.getTaskId(),ScheduleConstants.EXECUTED);
+        }
+    }catch (Exception e){
+        e.printStackTrace();
+        log.error("poll task exception");
+    }
+
+    return task;
+}
+```
+
+#### 3.5 未来数据定时刷新
+
+##### 3.5.1 reids key值匹配
+
+方案1：keys 模糊匹配
+
+keys的模糊匹配功能很方便也很强大，但是在生产环境需要慎用！开发中使用keys的模糊匹配却发现redis的**CPU使用率极高**，所以公司的redis生产环境将**keys命令禁用**了！**redis是单线程，会被堵塞**。
+
+<div align="center">
+    <img src="截图/延迟任务/key.png" alt="key" />
+</div>
+
+方案2：scan 
+
+SCAN 命令是一个**基于游标的迭代器**，SCAN命令每次被调用之后， 都会向用户**返回一个新的游标**， 用户在下次迭代时需要使用这个新游标作为SCAN命令的**游标参数**， 以此来延续之前的迭代过程。
+
+<div align="center">
+    <img src="截图/延迟任务/scan.png" alt="scan" />
+</div>
+
+##### 3.5.2 reids管道
+
+普通redis客户端和服务器交互模式
+
+<div align="center">
+    <img src="截图/延迟任务/普通交互.png" alt="普通交互" />
+</div>
+
+Pipeline请求模型
+
+<div align="center">
+    <img src="截图/延迟任务/Pipeline.png" alt="Pipeline" />
+</div>
+
+官方测试结果数据对比
+
+<div align="center">
+    <img src="截图/延迟任务/官方测试结果对比.png" alt="官方测试结果对比" />
+</div>
+
+##### 3.5.3 核心代码
+
+```java
+@Scheduled(cron = "0 */1 * * * ?")
+public void refresh() {
+    System.out.println(System.currentTimeMillis() / 1000 + "执行了定时任务");
+
+    // 获取所有未来数据集合的key值
+    Set<String> futureKeys = cacheService.scan(ScheduleConstants.FUTURE + "*");// future_*
+    for (String futureKey : futureKeys) { // future_250_250
+
+        String topicKey = ScheduleConstants.TOPIC + futureKey.split(ScheduleConstants.FUTURE)[1];
+        //获取该组key下当前需要消费的任务数据
+        Set<String> tasks = cacheService.zRangeByScore(futureKey, 0, System.currentTimeMillis());
+        if (!tasks.isEmpty()) {
+            //将这些任务数据添加到消费者队列中
+            cacheService.refreshWithPipeline(futureKey, topicKey, tasks);
+            System.out.println("成功的将" + futureKey + "下的当前需要执行的任务数据刷新到" + topicKey + "下");
+        }
+    }
+}
+```
+
+在引导类中添加开启任务调度注解：`@EnableScheduling`
+
+#### 3.6 分布式锁解决集群下的方法抢占执行
+
+##### 3.6.1 问题描述
+
+启动两台heima-leadnews-schedule服务，每台服务都会去执行refresh定时任务方法
+
+<div align="center">
+    <img src="截图/延迟任务/集群抢占.png" alt="集群抢占" />
+</div>
+
+##### 3.6.2 分布式锁
+
+分布式锁：控制分布式系统有序的去对共享资源进行操作，通过互斥来保证数据的一致性。
+
+解决方案：
+
+<div align="center">
+    <img src="截图/延迟任务/分布式锁.png" alt="分布式锁" />
+</div>
+
+##### 3.6.3 redis分布式锁
+
+sexnx （SET if Not eXists） 命令在指定的 key 不存在时，为 key 设置指定的值。
+
+<div align="center">
+    <img src="截图/延迟任务/redis分布式锁.png" alt="redis分布式锁" />
+</div>
+
+这种加锁的思路是，如果 key 不存在则为 key 设置 value，如果 key 已存在则 SETNX 命令不做任何操作
+
+- 客户端A请求服务器设置key的值，如果设置成功就表示加锁成功
+- 客户端B也去请求服务器设置key的值，如果返回失败，那么就代表加锁失败
+- 客户端A执行代码完成，删除锁
+- 客户端B在等待一段时间后再去请求设置key的值，设置成功
+- 客户端B执行代码完成，删除锁
+
+##### 3.6.4 在工具类CacheService中添加方法
+
+```java
+/**
+ * 加锁
+ *
+ * @param name
+ * @param expire
+ * @return
+ */
+public String tryLock(String name, long expire) {
+    name = name + "_lock";
+    String token = UUID.randomUUID().toString();
+    RedisConnectionFactory factory = stringRedisTemplate.getConnectionFactory();
+    RedisConnection conn = factory.getConnection();
+    try {
+
+        //参考redis命令：
+        //set key value [EX seconds] [PX milliseconds] [NX|XX]
+        Boolean result = conn.set(
+                name.getBytes(),
+                token.getBytes(),
+                Expiration.from(expire, TimeUnit.MILLISECONDS),
+                RedisStringCommands.SetOption.SET_IF_ABSENT //NX
+        );
+        if (result != null && result)
+            return token;
+    } finally {
+        RedisConnectionUtils.releaseConnection(conn, factory,false);
+    }
+    return null;
+}
+```
+
+修改未来数据定时刷新的方法，如下：
+
+```java
+/**
+ * 未来数据定时刷新
+ */
+@Scheduled(cron = "0 */1 * * * ?")
+public void refresh(){
+
+    String token = cacheService.tryLock("FUTURE_TASK_SYNC", 1000 * 30);
+    if(StringUtils.isNotBlank(token)){
+        log.info("未来数据定时刷新---定时任务");
+
+        //获取所有未来数据的集合key
+        Set<String> futureKeys = cacheService.scan(ScheduleConstants.FUTURE + "*");
+        for (String futureKey : futureKeys) {//future_100_50
+
+            //获取当前数据的key  topic
+            String topicKey = ScheduleConstants.TOPIC+futureKey.split(ScheduleConstants.FUTURE)[1];
+
+            //按照key和分值查询符合条件的数据
+            Set<String> tasks = cacheService.zRangeByScore(futureKey, 0, System.currentTimeMillis());
+
+            //同步数据
+            if(!tasks.isEmpty()){
+                cacheService.refreshWithPipeline(futureKey,topicKey,tasks);
+                log.info("成功的将"+futureKey+"刷新到了"+topicKey);
+            }
+        }
+    }
+}
+```
+
+#### 3.7 数据库同步到redis
+
+<div align="center">
+    <img src="截图/延迟任务/数据库同步到redis.png" alt="数据库同步到redis" />
+</div>
+
+
+
+```java
+@Scheduled(cron = "0 */5 * * * ?")
+@PostConstruct //机器宕机了，希望在恢复之后第一时间做数据的同步
+public void reloadData() {
+    clearCache();
+    log.info("数据库数据同步到缓存");
+    Calendar calendar = Calendar.getInstance();
+    calendar.add(Calendar.MINUTE, 5);
+
+    //查看小于未来5分钟的所有任务
+    List<Taskinfo> allTasks = taskinfoMapper.selectList(Wrappers.<Taskinfo>lambdaQuery().lt(Taskinfo::getExecuteTime,calendar.getTime()));
+    if(allTasks != null && allTasks.size() > 0){
+        for (Taskinfo taskinfo : allTasks) {
+            Task task = new Task();
+            BeanUtils.copyProperties(taskinfo,task);
+            task.setExecuteTime(taskinfo.getExecuteTime().getTime());
+            addTaskToCache(task);
+        }
+    }
+}
+
+private void clearCache(){
+    // 删除缓存中未来数据集合和当前消费者队列的所有key
+    Set<String> futurekeys = cacheService.scan(ScheduleConstants.FUTURE + "*");// future_
+    Set<String> topickeys = cacheService.scan(ScheduleConstants.TOPIC + "*");// topic_
+    cacheService.delete(futurekeys);
+    cacheService.delete(topickeys);
+}
+```
+
+### 4. 延迟队列解决精准时间发布文章
+
+##### 4.1 延迟队列服务提供对外接口
+
+提供远程的feign接口，在heima-leadnews-feign-api编写类如下：
+
+```java
+@FeignClient("leadnews-schedule")
+public interface IScheduleClient {
+
+    /**
+     * 添加任务
+     * @param task   任务对象
+     * @return       任务id
+     */
+    @PostMapping("/api/v1/task/add")
+    public ResponseResult  addTask(@RequestBody Task task);
+
+    /**
+     * 取消任务
+     * @param taskId        任务id
+     * @return              取消结果
+     */
+    @GetMapping("/api/v1/task/cancel/{taskId}")
+    public ResponseResult cancelTask(@PathVariable("taskId") long taskId);
+
+    /**
+     * 按照类型和优先级来拉取任务
+     * @param type
+     * @param priority
+     * @return
+     */
+    @GetMapping("/api/v1/task/poll/{type}/{priority}")
+    public ResponseResult poll(@PathVariable("type") int type,@PathVariable("priority")  int priority);
+}
+```
+
+在heima-leadnews-schedule微服务下提供对应的实现
+
+```java
+@RestController
+public class ScheduleClient implements IScheduleClient {
+
+    @Autowired
+    private TaskService taskService;
+
+    /**
+     * 添加任务
+     * @param task 任务对象
+     * @return 任务id
+     */
+    @PostMapping("/api/v1/task/add")
+    @Override
+    public ResponseResult addTask(@RequestBody Task task) {
+        return ResponseResult.okResult(taskService.addTask(task));
+    }
+
+    /**
+     * 取消任务
+     * @param taskId 任务id
+     * @return 取消结果
+     */
+    @GetMapping("/api/v1/task/cancel/{taskId}")
+    @Override
+    public ResponseResult cancelTask(@PathVariable("taskId") long taskId) {
+        return ResponseResult.okResult(taskService.cancelTask(taskId));
+    }
+
+    /**
+     * 按照类型和优先级来拉取任务
+     * @param type
+     * @param priority
+     * @return
+     */
+    @GetMapping("/api/v1/task/poll/{type}/{priority}")
+    @Override
+    public ResponseResult poll(@PathVariable("type") int type, @PathVariable("priority") int priority) {
+        return ResponseResult.okResult(taskService.poll(type,priority));
+    }
+}
+```
+
+##### 4.2 发布文章集成添加延迟队列接口
+
+枚举类：
+
+```java
+@Getter
+@AllArgsConstructor
+public enum TaskTypeEnum {
+
+    NEWS_SCAN_TIME(1001, 1,"文章定时审核"),
+    REMOTEERROR(1002, 2,"第三方接口调用失败，重试");
+    private final int taskType; //对应具体业务
+    private final int priority; //业务不同级别
+    private final String desc; //描述信息
+}
+```
+
+###### 4.2.1 序列化工具对比
+
+- JdkSerialize：java内置的序列化能将实现了Serilazable接口的对象进行序列化和反序列化， ObjectOutputStream的writeObject()方法可序列化对象生成字节数组
+- Protostuff：google开源的protostuff采用更为紧凑的二进制数组，表现更加优异，然后使用protostuff的编译工具生成pojo类
+
+###### 4.2.2 核心代码
+
+```java
+@Service
+@Slf4j
+public class WmNewsTaskServiceImpl  implements WmNewsTaskService {
+
+    @Autowired
+    private IScheduleClient scheduleClient;
+
+    /**
+     * 添加任务到延迟队列中
+     * @param id          文章的id
+     * @param publishTime 发布的时间  可以做为任务的执行时间
+     */
+    @Override
+    @Async //异步方法
+    public void addNewsToTask(Integer id, Date publishTime) {
+
+        log.info("添加任务到延迟服务中----begin");
+
+        Task task = new Task();
+        task.setExecuteTime(publishTime.getTime());
+        task.setTaskType(TaskTypeEnum.NEWS_SCAN_TIME.getTaskType());
+        task.setPriority(TaskTypeEnum.NEWS_SCAN_TIME.getPriority());
+        WmNews wmNews = new WmNews();
+        wmNews.setId(id);
+        task.setParameters(ProtostuffUtil.serialize(wmNews));
+
+        scheduleClient.addTask(task);
+
+        log.info("添加任务到延迟服务中----end");
+    }
+    
+}
+```
+
+修改发布文章代码：
+
+把之前的异步调用修改为调用延迟任务
+
+```java
+    //审核文章
+    //        wmNewsAutoScanService.autoScanWmNews(wmNews.getId());
+    wmNewsTaskService.addNewsToTask(wmNews.getId(),wmNews.getPublishTime());
+```
+
+##### 4.3 消费任务进行审核文章
+
+实现
+
+```java
+@Autowired
+private WmNewsAutoScanServiceImpl wmNewsAutoScanService;
+
+/**
+     * 消费延迟队列数据
+     */
+@Scheduled(fixedRate = 1000)
+@Override
+@SneakyThrows
+public void scanNewsByTask() {
+
+    log.info("文章审核---消费任务执行---begin---");
+
+    ResponseResult responseResult = scheduleClient.poll(TaskTypeEnum.NEWS_SCAN_TIME.getTaskType(), TaskTypeEnum.NEWS_SCAN_TIME.getPriority());
+    if(responseResult.getCode().equals(200) && responseResult.getData() != null){
+        String json_str = JSON.toJSONString(responseResult.getData());
+        Task task = JSON.parseObject(json_str, Task.class);
+        byte[] parameters = task.getParameters();
+        WmNews wmNews = ProtostuffUtil.deserialize(parameters, WmNews.class);
+        System.out.println(wmNews.getId()+"-----------");
+        wmNewsAutoScanService.autoScanWmNews(wmNews.getId());
+    }
+    log.info("文章审核---消费任务执行---end---");
+}
+```
+
+在WemediaApplication自媒体的引导类中添加开启任务调度注解`@EnableScheduling`
