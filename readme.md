@@ -4336,3 +4336,439 @@ public void scanNewsByTask() {
 ```
 
 在WemediaApplication自媒体的引导类中添加开启任务调度注解`@EnableScheduling`
+
+## 十二、kafka及异步通知文章上下架
+
+### 1. 自媒体文章上下架
+
+需求分析
+
+<div align="center">
+    <img src="截图/文章上下架/需求分析.png" alt="需求分析" />
+</div>
+
+<div align="center">
+    <img src="截图/文章上下架/系统解耦.png" alt="系统解耦" />
+</div>
+
+### 2. kafka概述
+
+消息中间件对比                              
+
+| 特性       | ActiveMQ                               | RabbitMQ                   | RocketMQ                 | Kafka                                    |
+| ---------- | -------------------------------------- | -------------------------- | ------------------------ | ---------------------------------------- |
+| 开发语言   | java                                   | erlang                     | java                     | scala                                    |
+| 单机吞吐量 | 万级                                   | 万级                       | 10万级                   | 100万级                                  |
+| 时效性     | ms                                     | us                         | ms                       | ms级以内                                 |
+| 可用性     | 高（主从）                             | 高（主从）                 | 非常高（分布式）         | 非常高（分布式）                         |
+| 功能特性   | 成熟的产品、较全的文档、各种协议支持好 | 并发能力强、性能好、延迟低 | MQ功能比较完善，扩展性佳 | 只支持主要的MQ功能，主要应用于大数据领域 |
+
+消息中间件对比-选择建议
+
+| **消息中间件** | **建议**                                                     |
+| -------------- | ------------------------------------------------------------ |
+| Kafka          | 追求高吞吐量，适合产生大量数据的互联网服务的数据收集业务     |
+| RocketMQ       | 可靠性要求很高的金融互联网领域,稳定性高，经历了多次阿里双11考验 |
+| RabbitMQ       | 性能较好，社区活跃度高，数据量没有那么大，优先选择功能比较完备的RabbitMQ |
+
+kafka介绍
+
+Kafka 是一个**分布式流媒体平台**,类似于消息队列或企业消息传递系统。kafka官网：http://kafka.apache.org/  
+
+<div align="center">
+    <img src="截图/文章上下架/kafka.png" alt="kafka" />
+</div>
+
+kafka介绍-名词解释
+
+<div align="center">
+    <img src="截图/文章上下架/名词解释.png" alt="名词解释" />
+</div>
+
+- producer：发布消息的对象称之为主题生产者（Kafka topic producer）
+
+- topic：Kafka将消息分门别类，每一类的消息称之为一个主题（Topic）
+
+- consumer：订阅消息并处理发布的消息的对象称之为主题消费者（consumers）
+
+- broker：已发布的消息保存在一组服务器中，称之为Kafka集群。集群中的**每一个服务器**都是一个**代理（Broker）**。 消费者可以订阅一个或多个主题（topic），并从Broker拉数据，从而消费这些已发布的消息。
+
+### 3. kafka安装配置
+
+Kafka对于zookeeper是强依赖，保存kafka相关的节点数据，所以安装Kafka之前必须先安装zookeeper
+
+- Docker安装zookeeper
+
+下载镜像：
+
+```shell
+docker pull zookeeper:3.4.14
+```
+
+创建容器
+
+```shell
+docker run -d --name zookeeper -p 2181:2181 zookeeper:3.4.14
+```
+
+- Docker安装kafka
+
+下载镜像：
+
+```shell
+docker pull wurstmeister/kafka:2.12-2.3.1
+```
+
+创建容器
+
+```shell
+docker run -d --name kafka \
+--env KAFKA_ADVERTISED_HOST_NAME=192.168.200.130 \
+--env KAFKA_ZOOKEEPER_CONNECT=192.168.200.130:2181 \
+--env KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://192.168.200.130:9092 \
+--env KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092 \
+--env KAFKA_HEAP_OPTS="-Xmx256M -Xms256M" \
+--net=host wurstmeister/kafka:2.12-2.3.1
+```
+
+### 4. kafka高可用设计
+
+#### 4.1 集群
+
+<div align="center">
+    <img src="截图/文章上下架/集群.png" alt="集群" />
+</div>
+
+- Kafka 的服务器端由被称为 Broker 的**服务进程**构成，即一个 Kafka 集群由多个 Broker 组成
+
+- 这样如果集群中某一台机器宕机，其他机器上的 Broker 也依然能够对外提供服务。这其实就是 Kafka 提供高可用的手段之一
+
+#### 4.2 备份机制(Replication）
+
+<div align="center">
+    <img src="截图/文章上下架/备份机制.png" alt="备份机制" />
+</div>
+
+Kafka 中消息的备份又叫做 **副本（Replica）**
+
+Kafka 定义了两类副本：
+
+- 领导者副本（Leader Replica）
+
+- 追随者副本（Follower Replica）
+
+##### 同步方式
+
+<div align="center">
+    <img src="截图/文章上下架/同步方式.png" alt="同步方式" />
+</div>
+
+ISR（in-**sync** replica）需要**同步复制**保存的follower
+
+
+
+如果leader失效后，需要选出新的leader，选举的原则如下：
+
+第一：选举时**优先从ISR**中选定，因为这个列表中follower的数据是与leader**同步**的
+
+第二：如果ISR列表中的follower**都不行了**，就**只能从其他follower中选取**
+
+
+
+极端情况，就是所有副本都失效了，这时有两种方案
+
+第一：**等待ISR中的一个活过来，**选为Leader，**数据可靠**，但活过来的**时间不确定**
+
+第二：**选择第一个活**过来的Replication，不一定是ISR中的，选为leader，以**最快速度恢复可用性**，**但数据不一定完整**
+
+### 5. 生产者详解
+
+#### 5.1 参数详解
+
+- ack
+
+代码的配置方式：
+
+```java
+//ack配置  消息确认机制
+prop.put(ProducerConfig.ACKS_CONFIG,"all");
+```
+
+参数的选择说明
+
+| **确认机制**     | **说明**                                                     |
+| ---------------- | ------------------------------------------------------------ |
+| acks=0           | 生产者在成功写入消息之前不会等待任何来自服务器的响应,消息有丢失的风险，但是速度最快 |
+| acks=1（默认值） | 只要集群**首领节点**收到消息，生产者就会收到一个来自服务器的成功响应 |
+| acks=all         | 只有当所有参与赋值的节点全部收到消息时，生产者才会收到一个来自服务器的成功响应 |
+
+- retries
+
+生产者从服务器收到的错误有可能是临时性错误，在这种情况下，retries参数的值决定了生产者可以重发消息的次数，如果达到这个次数，生产者会放弃重试返回错误，**默认情况**下，生产者会在每次重试之间等待**100ms**
+
+代码中配置方式：
+
+```java
+//重试次数
+prop.put(ProducerConfig.RETRIES_CONFIG,10);
+```
+
+- 消息压缩
+
+默认情况下， 消息发送时不会被压缩。
+
+代码中配置方式：
+
+```java
+//数据压缩
+prop.put(ProducerConfig.COMPRESSION_TYPE_CONFIG,"lz4");
+```
+
+| **压缩算法** | **说明**                                                     |
+| ------------ | ------------------------------------------------------------ |
+| snappy       | 占用较少的  CPU，  却能提供较好的性能和相当可观的压缩比， 如果看重性能和网络带宽，建议采用 |
+| lz4          | 占用较少的 CPU， 压缩和解压缩速度较快，压缩比也很客观        |
+| gzip         | 占用较多的  CPU，但会提供更高的压缩比，网络带宽有限，可以使用这种算法 |
+
+**使用压缩可以降低网络传输开销和存储开销，而这往往是向 Kafka 发送消息的瓶颈所在**。
+
+### 6.消费者详解
+
+#### 6.1 消费者组
+
+<div align="center">
+    <img src="截图/文章上下架/消费者.png" alt="消费者" />
+</div>
+
+- 消费者组（Consumer Group） ：指的就是由**一个或多个消费者**组成的群体
+
+- 一个发布在Topic上消息被分发给**此消费者组中的一个消费者**
+
+  - 所有的消费者都在一个组中，那么这就变成了queue模型
+
+  - 所有的消费者都在不同的组中，那么就完全变成了发布-订阅模型
+
+#### 6.2 消息有序性
+
+应用场景：
+
+- 即时消息中的单对单聊天和群聊，保证发送方消息发送顺序与接收方的顺序一致
+
+- 充值转账两个渠道在同一个时间进行余额变更，短信通知必须要有顺序
+
+<div align="center">
+    <img src="截图/文章上下架/有序性.png" alt="有序性" />
+</div>
+
+**topic分区**中消息只能由**消费者组中的唯一一个消费者**处理，所以消息肯定是**按照先后顺序**进行处理的。但是它也仅仅是保证Topic的一个分区顺序处理，**不能保证跨分区的消息先后处理顺序**。 所以，如果你**想要顺序的处理**Topic的所有消息，那就**只提供一个分区**。
+
+#### 6.3 提交和偏移量
+
+kafka**不会**像其他JMS队列那样**需要得到消费者的确认**，消费者可以使用kafka来追踪消息在分区的位置（偏移量）
+
+消费者会往一个叫做**_consumer_offset**的特殊主题发送消息，消息里包含了每个分区的偏移量。如果消费者发生**崩溃**或有新的消费者**加入**群组，就会**触发再均衡**
+
+<div align="center">
+    <img src="截图/文章上下架/正常情况.png" alt="正常情况" />
+</div>
+
+正常的情况
+
+<div align="center">
+    <img src="截图/文章上下架/挂掉情况.png" alt="挂掉情况" />
+</div>
+
+如果消费者2挂掉以后，会发生再均衡，消费者2**负责的分区**会被**其他消费者**进行消费
+
+再均衡后不可避免会出现一些问题
+
+问题一：
+
+<div align="center">
+    <img src="截图/文章上下架/问题1.png" alt="问题1" />
+</div>
+
+如果**提交偏移量**小于客户端**处理的最后一个消息的偏移量**，那么处于两个偏移量之间的消息就会被**重复处理**。
+
+
+
+问题二：
+
+<div align="center">
+    <img src="截图/文章上下架/问题2.png" alt="问题2" />
+</div>
+
+如果提交的偏移量**大于**客户端的最后一个消息的偏移量，那么处于两个偏移量之间的消息将会**丢失**。
+
+如果想要解决这些问题，还要知道目前kafka提交偏移量的方式：
+
+提交偏移量的方式有两种，分别是自动提交偏移量和手动提交
+
+- 自动提交偏移量
+
+当enable.auto.commit被设置为true，提交方式就是让消费者自动提交偏移量，**每隔5秒**消费者会自动把从**poll()**方法接收的**最大偏移量**提交上去
+
+- 手动提交 ，当enable.auto.commit被设置为false可以有以下三种提交方式
+
+  - 提交当前偏移量（同步提交）
+
+  - 异步提交
+
+  - 同步和异步组合提交
+
+1.提交当前偏移量（同步提交）
+
+把`enable.auto.commit`设置为false,让应用程序决定何时提交偏移量。使用**commitSync()**提交偏移量，commitSync()将会**提交poll返回的最新的偏移量**，所以在处理完所有记录后要确保调用了commitSync()方法。否则还是会有消息丢失的风险。
+
+只要没有发生不可恢复的错误，commitSync()方法会一直尝试直至提交成功，如果提交失败也可以记录到错误日志里。
+
+2.异步提交
+
+手动提交有一个缺点，那就是当发起提交调用时应用会**阻塞**。当然我们可以减少手动提交的频率，但这个会增加消息重复的概率（和自动提交一样）。另外一个解决办法是，使用异步提交的API。
+
+3.同步和异步组合提交
+
+**异步**提交也有个**缺点**，那就是如果服务器返回提交失败，**异步提交不会进行重试**。相比较起来，同步提交会进行重试直到成功或者最后抛出异常给应用。**异步提交没有实现重试是因为，如果同时存在多个异步提交，进行重试可能会导致位移覆盖。**
+
+举个例子，假如我们发起了一个异步提交**commitA**，此时的提交位移为**2000**，随后又发起了一个异步提交**commitB**且位移为**3000**；**commitA提交失败但commitB提交成功**，此时commitA进行**重试并成功**的话，会将实际上将已经提交的位移从**3000回滚到2000**，导致消息**重复消费**。
+
+### 7. 自媒体文章上下架功能完成
+
+#### 7.1 需求分析
+
+- 已发表且已上架的文章可以下架
+
+- 已发表且已下架的文章可以上架
+
+#### 7.2 流程说明
+
+<div align="center">
+    <img src="截图/文章上下架/上下架流程.png" alt="上下架流程" />
+</div>
+
+#### 7.3 接口定义
+
+|          | **说明**                |
+| -------- | ----------------------- |
+| 接口路径 | /api/v1/news/down_or_up |
+| 请求方式 | POST                    |
+| 参数     | DTO                     |
+| 响应结果 | ResponseResult          |
+
+ DTO  
+
+```java
+@Data
+public class WmNewsDto {
+    
+    private Integer id;
+    /**
+    * 是否上架  0 下架  1 上架
+    */
+    private Short enable;
+                       
+}
+```
+
+#### 7.4 核心代码
+
+```java
+/**
+ * 文章的上下架
+ * @param dto
+ * @return
+ */
+@Override
+public ResponseResult downOrUp(WmNewsDto dto) {
+    //1.检查参数
+    if(dto.getId() == null){
+        return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID);
+    }
+
+    //2.查询文章
+    WmNews wmNews = getById(dto.getId());
+    if(wmNews == null){
+        return ResponseResult.errorResult(AppHttpCodeEnum.DATA_NOT_EXIST,"文章不存在");
+    }
+
+    //3.判断文章是否已发布
+    if(!wmNews.getStatus().equals(WmNews.Status.PUBLISHED.getCode())){
+        return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID,"当前文章不是发布状态，不能上下架");
+    }
+
+    //4.修改文章enable
+    if(dto.getEnable() != null && dto.getEnable() > -1 && dto.getEnable() < 2){
+        update(Wrappers.<WmNews>lambdaUpdate().set(WmNews::getEnable,dto.getEnable())
+                .eq(WmNews::getId,wmNews.getId()));
+    }
+    return ResponseResult.okResult(AppHttpCodeEnum.SUCCESS);
+}
+```
+
+#### 7.5 消息通知article端文章上下架
+
+在自媒体端文章上下架后发送消息
+
+```java
+//发送消息，通知article端修改文章配置
+if(wmNews.getArticleId() != null){
+    Map<String,Object> map = new HashMap<>();
+    map.put("articleId",wmNews.getArticleId());
+    map.put("enable",dto.getEnable());
+    kafkaTemplate.send(WmNewsMessageConstants.WM_NEWS_UP_OR_DOWN_TOPIC,JSON.toJSONString(map));
+}
+```
+
+常量类：
+
+```java
+public class WmNewsMessageConstants {
+
+    public static final String WM_NEWS_UP_OR_DOWN_TOPIC="wm.news.up.or.down.topic";
+}
+```
+
+在**article端**编写监听，接收数据
+
+```java
+@Component
+@Slf4j
+public class ArtilceIsDownListener {
+
+    @Autowired
+    private ApArticleConfigService apArticleConfigService;
+
+    @KafkaListener(topics = WmNewsMessageConstants.WM_NEWS_UP_OR_DOWN_TOPIC)
+    public void onMessage(String message){
+        if(StringUtils.isNotBlank(message)){
+            Map map = JSON.parseObject(message, Map.class);
+            apArticleConfigService.updateByMap(map);
+            log.info("article端文章配置修改，articleId={}",map.get("articleId"));
+        }
+    }
+}
+```
+
+```java
+@Service
+@Slf4j
+@Transactional
+public class ApArticleConfigServiceImpl extends ServiceImpl<ApArticleConfigMapper, ApArticleConfig> implements ApArticleConfigService {
+    /**
+     * 修改文章配置
+     * @param map
+     */
+    @Override
+    public void updateByMap(Map map) {
+        //0 下架 1 上架
+        Object enable = map.get("enable");
+        boolean isDown = true;
+        if(enable.equals(1)){
+            isDown = false;
+        }
+        //修改文章配置
+        update(Wrappers.<ApArticleConfig>lambdaUpdate().eq(ApArticleConfig::getArticleId,map.get("articleId")).set(ApArticleConfig::getIsDown,isDown));
+    }
+}
+```
+
