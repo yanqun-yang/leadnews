@@ -4772,3 +4772,3017 @@ public class ApArticleConfigServiceImpl extends ServiceImpl<ApArticleConfigMappe
 }
 ```
 
+## 十三、app端文章搜索
+
+### 1. App端搜索-效果图
+
+<div align="center">
+    <img src="截图/文章搜索/App端搜索效果图.png" alt="App端搜索效果图" />
+</div>
+
+### 2. 搭建ElasticSearch环境
+
+#### 2.1 拉取镜像
+
+```shell
+docker pull elasticsearch:7.4.0
+```
+
+#### 2.2 创建容器
+
+```shell
+docker run -id --name elasticsearch -d --restart=always -p 9200:9200 -p 9300:9300 -v /usr/share/elasticsearch/plugins:/usr/share/elasticsearch/plugins -e "discovery.type=single-node" elasticsearch:7.4.0
+```
+
+#### 2.3 配置中文分词器 ik
+
+因为在创建elasticsearch容器的时候，映射了目录，所以可以在宿主机上进行配置ik中文分词器
+
+在去选择ik分词器的时候，需要与elasticsearch的版本对应上
+
+把`elasticsearch-analysis-ik-7.4.0.zip`上传到服务器上,放到对应目录（plugins）解压
+
+```shell
+#切换目录
+cd /usr/share/elasticsearch/plugins
+#新建目录
+mkdir analysis-ik
+cd analysis-ik
+#root根目录中拷贝文件
+mv elasticsearch-analysis-ik-7.4.0.zip /usr/share/elasticsearch/plugins/analysis-ik
+#解压文件
+cd /usr/share/elasticsearch/plugins/analysis-ik
+unzip elasticsearch-analysis-ik-7.4.0.zip
+```
+
+### 3. app端文章搜索
+
+#### 3.1 需求分析
+
+- 用户输入关键可搜索文章列表
+
+- 关键词高亮显示
+
+- 文章列表展示与home展示一样，当用户点击某一篇文章，可查看文章详情
+
+#### 3.2 思路分析
+
+为了加快检索的效率，在查询的时候不会直接从数据库中查询文章，需要在elasticsearch中进行高速检索。
+
+<div align="center">
+    <img src="截图/文章搜索/搜索思路分析.png" alt="搜索思路分析" />
+</div>
+
+#### 3.3 创建索引和映射
+
+使用postman添加映射
+
+put请求 ： http://192.168.200.130:9200/app_info_article
+
+```json
+{
+    "mappings":{
+        "properties":{
+            "id":{
+                "type":"long"
+            },
+            "publishTime":{
+                "type":"date"
+            },
+            "layout":{
+                "type":"integer"
+            },
+            "images":{
+                "type":"keyword",
+                "index": false
+            },
+            "staticUrl":{
+                "type":"keyword",
+                "index": false
+            },
+            "authorId": {
+                "type": "long"
+            },
+            "authorName": {
+                "type": "text"
+            },
+            "title":{
+                "type":"text",
+                "analyzer":"ik_smart"
+            },
+            "content":{
+                "type":"text",
+                "analyzer":"ik_smart"
+            }
+        }
+    }
+}
+```
+
+GET请求查询映射：http://192.168.200.130:9200/app_info_article
+
+DELETE请求，删除索引及映射：http://192.168.200.130:9200/app_info_article
+
+GET请求，查询所有文档：http://192.168.200.130:9200/app_info_article/_search
+
+### 4. 数据初始化到索引库
+
+#### 4.1 核心代码
+
+```java
+@SpringBootTest
+@RunWith(SpringRunner.class)
+public class ApArticleTest {
+    
+    @Autowired
+    private ApArticleMapper apArticleMapper;
+    @Autowired
+    private RestHighLevelClient restHighLevelClient;
+    
+    /**
+     * 注意：数据量的导入，如果数据量过大，需要分页导入
+     * @throws Exception
+     */
+    @Test
+    public void init() throws Exception {
+
+        //1.查询所有符合条件的文章数据
+        List<SearchArticleVo> searchArticleVos = apArticleMapper.loadArticleList();
+
+        //2.批量导入到es索引库
+        BulkRequest bulkRequest = new BulkRequest("app_info_article");
+
+        for (SearchArticleVo searchArticleVo : searchArticleVos) {
+
+            IndexRequest indexRequest = new IndexRequest().id(searchArticleVo.getId().toString())
+                    .source(JSON.toJSONString(searchArticleVo), XContentType.JSON);
+
+            //批量添加数据
+            bulkRequest.add(indexRequest);
+
+        }
+        restHighLevelClient.bulk(bulkRequest, RequestOptions.DEFAULT);
+    }
+}
+```
+
+### 5. 文章搜索功能实现
+
+#### 5.1 搭建搜索微服务
+
+```xml
+<!--elasticsearch-->
+<dependency>
+    <groupId>org.elasticsearch.client</groupId>
+    <artifactId>elasticsearch-rest-high-level-client</artifactId>
+    <version>7.4.0</version>
+</dependency>
+<dependency>
+    <groupId>org.elasticsearch.client</groupId>
+    <artifactId>elasticsearch-rest-client</artifactId>
+    <version>7.4.0</version>
+</dependency>
+<dependency>
+    <groupId>org.elasticsearch</groupId>
+    <artifactId>elasticsearch</artifactId>
+    <version>7.4.0</version>
+</dependency>
+```
+
+nacos配置中心leadnews-search
+
+```yaml
+spring:
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+elasticsearch:
+  host: 192.168.200.130
+  port: 9200
+```
+
+UserSearchDto
+
+```java
+@Data
+public class UserSearchDto {
+    /**
+    * 搜索关键字
+    */
+    String searchWords;
+    /**
+    * 当前页
+    */
+    int pageNum;
+    /**
+    * 分页条数
+    */
+    int pageSize;
+    /**
+    * 最小时间
+    */
+    Date minBehotTime;
+
+    public int getFromIndex(){
+        if(this.pageNum<1)return 0;
+        if(this.pageSize<1) this.pageSize = 10;
+        return this.pageSize * (pageNum-1);
+    }
+}
+```
+
+#### 5.2 核心代码
+
+```java
+@Service
+@Slf4j
+public class ArticleSearchServiceImpl implements ArticleSearchService {
+    @Autowired
+    private RestHighLevelClient restHighLevelClient;
+    /**
+     * es文章分页检索
+     * @param dto
+     * @return
+     */
+    @Override
+    public ResponseResult search(UserSearchDto dto) throws IOException {
+
+        //1.检查参数
+        if(dto == null || StringUtils.isBlank(dto.getSearchWords())){
+            return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID);
+        }
+
+        //2.设置查询条件
+        SearchRequest searchRequest = new SearchRequest("app_info_article");
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+
+        //布尔查询
+        BoolQueryBuilder boolQueryBuilder = QueryBuilders.boolQuery();
+
+        //关键字的分词之后查询
+        QueryStringQueryBuilder queryStringQueryBuilder = QueryBuilders.queryStringQuery(dto.getSearchWords()).field("title").field("content").defaultOperator(Operator.OR);
+        boolQueryBuilder.must(queryStringQueryBuilder);//must参与算分
+
+        //查询小于mindate的数据
+        RangeQueryBuilder rangeQueryBuilder = QueryBuilders.rangeQuery("publishTime").lt(dto.getMinBehotTime().getTime());
+        boolQueryBuilder.filter(rangeQueryBuilder);//不参与算分
+
+        //分页查询(查出来的文章都是比当前用户显示文章的发布时间早的，直接取前PageSize条)
+        searchSourceBuilder.from(0);
+        searchSourceBuilder.size(dto.getPageSize());
+
+        //按照发布时间倒序查询
+        searchSourceBuilder.sort("publishTime", SortOrder.DESC);
+
+        //设置高亮  title
+        HighlightBuilder highlightBuilder = new HighlightBuilder();
+        highlightBuilder.field("title");
+        highlightBuilder.preTags("<font style='color: red; font-size: inherit;'>");
+        highlightBuilder.postTags("</font>");
+        searchSourceBuilder.highlighter(highlightBuilder);
+
+
+        searchSourceBuilder.query(boolQueryBuilder);
+        searchRequest.source(searchSourceBuilder);
+        SearchResponse searchResponse = restHighLevelClient.search(searchRequest, RequestOptions.DEFAULT);
+
+        //3.结果封装返回
+        List<Map> list = new ArrayList<>();
+
+        SearchHit[] hits = searchResponse.getHits().getHits();
+        for (SearchHit hit : hits) {
+            String json = hit.getSourceAsString();
+            Map map = JSON.parseObject(json, Map.class);
+            //处理高亮
+            if(hit.getHighlightFields() != null && hit.getHighlightFields().size() > 0){
+                Text[] titles = hit.getHighlightFields().get("title").getFragments();
+                String title = StringUtils.join(titles);
+                //高亮标题
+                map.put("h_title",title);
+            }else {
+                //原始标题
+                map.put("h_title",map.get("title"));
+            }
+            list.add(map);
+        }
+        return ResponseResult.okResult(list);
+    }
+}
+```
+
+需要在app的网关中添加搜索微服务的路由配置
+
+```yaml
+#搜索微服务
+- id: leadnews-search
+ uri: lb://leadnews-search
+ predicates:
+   - Path=/search/**
+ filters:
+   - StripPrefix= 1
+```
+
+### 6. 文章自动审核构建索引
+
+#### 6.1 思路分析
+
+<div align="center">
+    <img src="截图/文章搜索/文章自动审核构建索引.png" alt="文章自动审核构建索引" />
+</div>
+
+#### 6.2 文章微服务发送消息
+
+SearchArticleVo
+
+```java
+package com.heima.model.search.vos;
+
+import lombok.Data;
+
+import java.util.Date;
+
+@Data
+public class SearchArticleVo {
+
+    // 文章id
+    private Long id;
+    // 文章标题
+    private String title;
+    // 文章发布时间
+    private Date publishTime;
+    // 文章布局
+    private Integer layout;
+    // 封面
+    private String images;
+    // 作者id
+    private Long authorId;
+    // 作者名词
+    private String authorName;
+    //静态url
+    private String staticUrl;
+    //文章内容
+    private String content;
+
+}
+```
+
+2.文章微服务的ArticleFreemarkerService中的buildArticleToMinIO方法中收集数据并发送消息
+
+```java
+@Service
+@Slf4j
+@Transactional
+public class ArticleFreemarkerServiceImpl implements ArticleFreemarkerService {
+
+    @Autowired
+    private ApArticleContentMapper apArticleContentMapper;
+    @Autowired
+    private Configuration configuration;
+    @Autowired
+    private FileStorageService fileStorageService;
+    @Autowired
+    private ApArticleService apArticleService;
+
+    /**
+     * 生成静态文件上传到minIO中
+     * @param apArticle
+     * @param content
+     */
+    @Async
+    @Override
+    public void buildArticleToMinIO(ApArticle apArticle, String content) {
+        //已知文章的id
+        //4.1 获取文章内容
+        if(StringUtils.isNotBlank(content)){
+            //4.2 文章内容通过freemarker生成html文件
+            Template template = null;
+            StringWriter out = new StringWriter();
+            try {
+                template = configuration.getTemplate("article.ftl");
+                //数据模型
+                Map<String,Object> contentDataModel = new HashMap<>();
+                contentDataModel.put("content", JSONArray.parseArray(content));
+                //合成
+                template.process(contentDataModel,out);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+            
+            //4.3 把html文件上传到minio中
+            InputStream in = new ByteArrayInputStream(out.toString().getBytes());
+            String path = fileStorageService.uploadHtmlFile("", apArticle.getId() + ".html", in);
+            
+            //4.4 修改ap_article表，保存static_url字段
+            apArticleService.update(Wrappers.<ApArticle>lambdaUpdate().eq(ApArticle::getId,apArticle.getId())
+                    .set(ApArticle::getStaticUrl,path));
+
+            //发送消息，创建索引
+            createArticleESIndex(apArticle,content,path);
+        }
+    }
+
+    @Autowired
+    private KafkaTemplate<String,String> kafkaTemplate;
+
+    /**
+     * 送消息，创建索引
+     * @param apArticle
+     * @param content
+     * @param path
+     */
+    private void createArticleESIndex(ApArticle apArticle, String content, String path) {
+        SearchArticleVo vo = new SearchArticleVo();
+        BeanUtils.copyProperties(apArticle,vo);
+        vo.setContent(content);
+        vo.setStaticUrl(path);
+
+        kafkaTemplate.send(ArticleConstants.ARTICLE_ES_SYNC_TOPIC, JSON.toJSONString(vo));
+    }
+}
+```
+
+在ArticleConstants类中添加新的常量，完整代码如下
+
+```java
+public class ArticleConstants {
+    public static final Short LOADTYPE_LOAD_MORE = 1;
+    public static final Short LOADTYPE_LOAD_NEW = 2;
+    public static final String DEFAULT_TAG = "__all__";
+
+    public static final String ARTICLE_ES_SYNC_TOPIC = "article.es.sync.topic";
+
+    public static final Integer HOT_ARTICLE_LIKE_WEIGHT = 3;
+    public static final Integer HOT_ARTICLE_COMMENT_WEIGHT = 5;
+    public static final Integer HOT_ARTICLE_COLLECTION_WEIGHT = 8;
+
+    public static final String HOT_ARTICLE_FIRST_PAGE = "hot_article_first_page_";
+}
+```
+
+#### 6.4 搜索微服务接收消息并创建索引
+
+##### 6.4.1 核心代码
+
+```java
+@Component
+@Slf4j
+public class SyncArticleListener {
+
+    @Autowired
+    private RestHighLevelClient restHighLevelClient;
+
+    @KafkaListener(topics = ArticleConstants.ARTICLE_ES_SYNC_TOPIC)
+    public void onMessage(String message){
+        if(StringUtils.isNotBlank(message)){
+
+            log.info("SyncArticleListener,message={}",message);
+
+            SearchArticleVo searchArticleVo = JSON.parseObject(message, SearchArticleVo.class);
+            IndexRequest indexRequest = new IndexRequest("app_info_article");
+            indexRequest.id(searchArticleVo.getId().toString());
+            indexRequest.source(message, XContentType.JSON);
+            try {
+                restHighLevelClient.index(indexRequest, RequestOptions.DEFAULT);
+            } catch (IOException e) {
+                e.printStackTrace();
+                log.error("sync es error={}",e);
+            }
+        }
+    }
+}
+```
+
+### 7. app端搜索-搜索记录
+
+#### 7.1 需求分析
+
+<div align="center">
+    <img src="截图/文章搜索/搜索记录.png" alt="搜索记录" />
+</div>
+
+- 展示用户的搜索记录10条，按照搜索关键词的时间倒序
+- 可以删除搜索记录
+- 保存历史记录，保存10条，多余的则删除最久的历史记录
+
+#### 7.2 数据存储说明
+
+用户的搜索记录，需要给每一个用户都保存一份，数据量较大，要求加载速度快，通常这样的数据存储到mongodb更合适，不建议直接存储到关系型数据库中
+
+<div align="center">
+    <img src="截图/文章搜索/MongoDB.png" alt="MongoDB" />
+</div>
+
+#### 7.3MongoDB安装及集成
+
+##### 3.1 安装MongoDB
+
+拉取镜像
+
+```
+docker pull mongo
+```
+
+创建容器
+
+```
+docker run -di --name mongo-service --restart=always -p 27017:27017 -v ~/data/mongodata:/data mongo
+```
+
+映射
+
+```java
+/**
+ * <p>
+ * 联想词表
+ * </p>
+ */
+@Data
+@Document("ap_associate_words")
+public class ApAssociateWords implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+
+    private String id;
+
+    /**
+     * 联想词
+     */
+    private String associateWords;
+
+    /**
+     * 创建时间
+     */
+    private Date createdTime;
+}
+```
+
+#### 7.3 核心方法
+
+```java
+@SpringBootTest(classes = MongoApplication.class)
+@RunWith(SpringRunner.class)
+public class MongoTest {
+
+    @Autowired
+    private MongoTemplate mongoTemplate;
+
+    //保存
+    @Test
+    public void saveTest(){
+        /*for (int i = 0; i < 10; i++) {
+            ApAssociateWords apAssociateWords = new ApAssociateWords();
+            apAssociateWords.setAssociateWords("黑马头条");
+            apAssociateWords.setCreatedTime(new Date());
+            mongoTemplate.save(apAssociateWords);
+        }*/
+        ApAssociateWords apAssociateWords = new ApAssociateWords();
+        apAssociateWords.setAssociateWords("黑马直播");
+        apAssociateWords.setCreatedTime(new Date());
+        mongoTemplate.save(apAssociateWords);
+    }
+
+    //查询一个
+    @Test
+    public void saveFindOne(){
+        ApAssociateWords apAssociateWords = mongoTemplate.findById("60bd973eb0c1d430a71a7928", ApAssociateWords.class);
+        System.out.println(apAssociateWords);
+    }
+
+    //条件查询
+    @Test
+    public void testQuery(){
+        Query query = Query.query(Criteria.where("associateWords").is("黑马头条"))
+                .with(Sort.by(Sort.Direction.DESC,"createdTime"));
+        List<ApAssociateWords> apAssociateWordsList = mongoTemplate.find(query, ApAssociateWords.class);
+        System.out.println(apAssociateWordsList);
+    }
+
+    @Test
+    public void testDel(){
+        mongoTemplate.remove(Query.query(Criteria.where("associateWords").is("黑马头条")),ApAssociateWords.class);
+    }
+}
+```
+
+#### 7.4 保存搜索记录
+
+##### 7.4.1 实现思路
+
+<div align="center">
+    <img src="截图/文章搜索/保存搜索记录.png" alt="保存搜索记录" />
+</div>
+
+用户输入关键字进行搜索的异步记录关键字
+
+<div align="center">
+    <img src="截图/文章搜索/关键词保存思路.png" alt="关键词保存思路" />
+</div>
+
+用户搜索记录对应的集合，对应实体类：
+
+```java
+/**
+ * <p>
+ * APP用户搜索信息表
+ * </p>
+ */
+@Data
+@Document("ap_user_search")
+public class ApUserSearch implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+
+    /**
+     * 主键
+     */
+    private String id;
+
+    /**
+     * 用户ID
+     */
+    private Integer userId;
+
+    /**
+     * 搜索词
+     */
+    private String keyword;
+
+    /**
+     * 创建时间
+     */
+    private Date createdTime;
+
+}
+```
+
+搜索微服务集成mongodb
+
+①：pom依赖
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-mongodb</artifactId>
+</dependency>
+```
+
+②：nacos配置
+
+```yaml
+spring:
+  data:
+   mongodb:
+    host: 192.168.200.130
+    port: 27017
+    database: leadnews-history
+```
+
+##### 7.4.2 核心代码
+
+```java
+@Service
+@Slf4j
+public class ApUserSearchServiceImpl implements ApUserSearchService {
+
+    @Autowired
+    private MongoTemplate mongoTemplate;
+    /**
+     * 保存用户搜索历史记录
+     * @param keyword
+     * @param userId
+     */
+    @Override
+    @Async //---------------！！！异步方法，不能从ThreadLocal获取userId了，要作为参数传入！！！---------------
+    public void insert(String keyword, Integer userId) {
+        //1.查询当前用户的搜索关键词
+        Query query = Query.query(Criteria.where("userId").is(userId).and("keyword").is(keyword));
+        ApUserSearch apUserSearch = mongoTemplate.findOne(query, ApUserSearch.class);
+
+        //2.存在 更新创建时间
+        if(apUserSearch != null){
+            apUserSearch.setCreatedTime(new Date());
+            mongoTemplate.save(apUserSearch);
+            return;
+        }
+
+        //3.不存在，判断当前历史记录总数量是否超过10
+        apUserSearch = new ApUserSearch();
+        apUserSearch.setUserId(userId);
+        apUserSearch.setKeyword(keyword);
+        apUserSearch.setCreatedTime(new Date());
+
+        Query query1 = Query.query(Criteria.where("userId").is(userId));
+        query1.with(Sort.by(Sort.Direction.DESC,"createdTime"));
+        List<ApUserSearch> apUserSearchList = mongoTemplate.find(query1, ApUserSearch.class);
+
+        if(apUserSearchList == null || apUserSearchList.size() < 10){
+            mongoTemplate.save(apUserSearch);
+        }else {
+            ApUserSearch lastUserSearch = apUserSearchList.get(apUserSearchList.size() - 1);
+            mongoTemplate.findAndReplace(Query.query(Criteria.where("id").is(lastUserSearch.getId())),apUserSearch);
+        }
+    }
+}
+```
+
+3.参考自媒体相关微服务，在搜索微服务中获取当前登录的用户
+
+4.在ArticleSearchService的search方法中调用保存历史记录
+
+```java
+@Service
+@Slf4j
+public class ArticleSearchServiceImpl implements ArticleSearchService {
+
+    @Autowired
+    private RestHighLevelClient restHighLevelClient;
+
+    @Autowired
+    private ApUserSearchService apUserSearchService;
+
+    /**
+     * es文章分页检索
+     *
+     * @param dto
+     * @return
+     */
+    @Override
+    public ResponseResult search(UserSearchDto dto) throws IOException {
+
+        //1.检查参数
+        if(dto == null || StringUtils.isBlank(dto.getSearchWords())){
+            return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID);
+        }
+
+        ApUser user = AppThreadLocalUtil.getUser();
+
+        //异步调用 保存搜索记录  只有首次搜索需要保存记录，后续下拉加载更多搜索内容不需要
+        if(user != null && dto.getFromIndex() == 0){
+            apUserSearchService.insert(dto.getSearchWords(), user.getId());
+        }
+
+
+        //2.设置查询条件
+        SearchRequest searchRequest = new SearchRequest("app_info_article");
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+
+        //布尔查询
+        BoolQueryBuilder boolQueryBuilder = QueryBuilders.boolQuery();
+
+        //关键字的分词之后查询
+        QueryStringQueryBuilder queryStringQueryBuilder = QueryBuilders.queryStringQuery(dto.getSearchWords()).field("title").field("content").defaultOperator(Operator.OR);
+        boolQueryBuilder.must(queryStringQueryBuilder);
+
+        //查询小于mindate的数据
+        RangeQueryBuilder rangeQueryBuilder = QueryBuilders.rangeQuery("publishTime").lt(dto.getMinBehotTime().getTime());
+        boolQueryBuilder.filter(rangeQueryBuilder);
+
+        //分页查询
+        searchSourceBuilder.from(0);
+        searchSourceBuilder.size(dto.getPageSize());
+
+        //按照发布时间倒序查询
+        searchSourceBuilder.sort("publishTime", SortOrder.DESC);
+
+        //设置高亮  title
+        HighlightBuilder highlightBuilder = new HighlightBuilder();
+        highlightBuilder.field("title");
+        highlightBuilder.preTags("<font style='color: red; font-size: inherit;'>");
+        highlightBuilder.postTags("</font>");
+        searchSourceBuilder.highlighter(highlightBuilder);
+
+
+        searchSourceBuilder.query(boolQueryBuilder);
+        searchRequest.source(searchSourceBuilder);
+        SearchResponse searchResponse = restHighLevelClient.search(searchRequest, RequestOptions.DEFAULT);
+
+
+        //3.结果封装返回
+
+        List<Map> list = new ArrayList<>();
+
+        SearchHit[] hits = searchResponse.getHits().getHits();
+        for (SearchHit hit : hits) {
+            String json = hit.getSourceAsString();
+            Map map = JSON.parseObject(json, Map.class);
+            //处理高亮
+            if(hit.getHighlightFields() != null && hit.getHighlightFields().size() > 0){
+                Text[] titles = hit.getHighlightFields().get("title").getFragments();
+                String title = StringUtils.join(titles);
+                //高亮标题
+                map.put("h_title",title);
+            }else {
+                //原始标题
+                map.put("h_title",map.get("title"));
+            }
+            list.add(map);
+        }
+
+        return ResponseResult.okResult(list);
+
+    }
+}
+```
+
+5.保存历史记录中开启异步调用，添加注解@Async
+
+6.在搜索微服务引导类上开启异步调用
+
+<div align="center">
+    <img src="截图/文章搜索/开启异步调用.png" alt="开启异步调用" />
+</div>
+
+7.测试，搜索后查看结果
+
+#### 7.5 加载搜索记录列表
+
+##### 7.5.1 思路分析
+
+按照当前用户，按照时间倒序查询
+
+|          | **说明**             |
+| -------- | -------------------- |
+| 接口路径 | /api/v1/history/load |
+| 请求方式 | POST                 |
+| 参数     | 无                   |
+| 响应结果 | ResponseResult       |
+
+##### 7.5.2核心代码
+
+```java
+ /**
+     * 查询搜索历史
+     *
+     * @return
+     */
+@Override
+public ResponseResult findUserSearch() {
+    //获取当前用户
+    ApUser user = AppThreadLocalUtil.getUser();
+    if(user == null){
+        return ResponseResult.errorResult(AppHttpCodeEnum.NEED_LOGIN);
+    }
+
+    //根据用户查询数据，按照时间倒序
+    List<ApUserSearch> apUserSearches = mongoTemplate.find(Query.query(Criteria.where("userId").is(user.getId())).with(Sort.by(Sort.Direction.DESC, "createdTime")), ApUserSearch.class);
+    return ResponseResult.okResult(apUserSearches);
+}
+```
+
+#### 7.6 删除搜索记录
+
+##### 7.6.1 思路分析
+
+按照搜索历史id删除
+
+|          | **说明**            |
+| -------- | ------------------- |
+| 接口路径 | /api/v1/history/del |
+| 请求方式 | POST                |
+| 参数     | HistorySearchDto    |
+| 响应结果 | ResponseResult      |
+
+HistorySearchDto
+
+```java
+@Data
+public class HistorySearchDto {
+    /**
+    * 接收搜索历史记录id
+    */
+    String id;
+}
+```
+
+### 8. app端搜索-关键字联想词
+
+#### 8.1 需求分析
+
+<div align="center">
+    <img src="截图/文章搜索/联想词.png" alt="联想词" />
+</div>
+
+- 根据用户输入的关键字展示联想词
+
+对应实体类
+
+```java
+/**
+ * <p>
+ * 联想词表
+ * </p>
+ */
+@Data
+@Document("ap_associate_words")
+public class ApAssociateWords implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+
+    private String id;
+
+    /**
+     * 联想词
+     */
+    private String associateWords;
+
+    /**
+     * 创建时间
+     */
+    private Date createdTime;
+}
+```
+
+#### 8.2 搜索词-数据来源
+
+通常是网上搜索频率比较高的一些词，通常在企业中有两部分来源：
+
+第一：自己维护搜索词
+
+通过分析用户搜索频率较高的词，按照排名作为搜索词
+
+第二：第三方获取
+
+关键词规划师（百度）、5118、爱站网
+
+#### 8.3 核心代码
+
+```java
+/**
+ * @Description:
+ * @Version: V1.0
+ */
+@Service
+public class ApAssociateWordsServiceImpl implements ApAssociateWordsService {
+
+    @Autowired
+    MongoTemplate mongoTemplate;
+
+    /**
+     * 联想词
+     * @param userSearchDto
+     * @return
+     */
+    @Override
+    public ResponseResult findAssociate(UserSearchDto userSearchDto) {
+        //1 参数检查
+        if(userSearchDto == null || StringUtils.isBlank(userSearchDto.getSearchWords())){
+            return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID);
+        }
+        //分页检查
+        if (userSearchDto.getPageSize() > 20) {
+            userSearchDto.setPageSize(20);
+        }
+
+        //3 执行查询 模糊查询
+        Query query = Query.query(Criteria.where("associateWords").regex(".*?\\" + userSearchDto.getSearchWords() + ".*"));
+        query.limit(userSearchDto.getPageSize());
+        List<ApAssociateWords> wordsList = mongoTemplate.find(query, ApAssociateWords.class);
+
+        return ResponseResult.okResult(wordsList);
+    }
+}
+```
+
+## 十四、xxl-Job分布式任务调度
+
+### 1. 需求分析
+
+<div align="center">
+    <img src="截图/分布式任务调度/需求分析.png" alt="需求分析" />
+</div>
+
+目前实现的思路：从数据库直接按照发布时间倒序查询
+
+- 问题1：
+
+  如何访问量较大，直接查询数据库，压力较大
+
+- 问题2：
+
+  新发布的文章会展示在前面，并不是热点文章
+
+### 2. 实现思路
+
+把热点数据存入redis进行展示
+
+判断文章是否是热点，有几项标准： 点赞数量，评论数量，阅读数量，收藏数量
+
+计算文章热度，有两种方案：
+
+1.定时计算文章热度
+
+<div align="center">
+    <img src="截图/分布式任务调度/定时计算.png" alt="定时计算" />
+</div>
+
+- 根据文章的行为（点赞、评论、阅读、收藏）计算文章的分值，利用定时任务每天完成一次计算
+
+- 把分值较大的文章数据存入到redis中
+
+- App端用户查询文章列表的时候，优先从redis中查询热度较高的文章数据
+
+2.实时计算文章热度
+
+### 3. 定时任务框架-xxljob
+
+spring传统的定时任务@Scheduled，但是这样存在这一些问题 ：
+
+- 做集群任务的重复执行问题
+
+- cron表达式定义在代码之中，修改不方便
+
+- 定时任务失败了，无法重试也没有统计
+
+- 如果任务量过大，不能有效的分片执行
+
+解决这些问题的方案为：
+
+xxl-job 分布式任务调度框架
+
+### 4. 分布式任务调度
+
+#### 4.1 什么是分布式任务调度
+
+当前软件的架构已经开始向分布式架构转变，将单体结构拆分为若干服务，服务之间通过网络交互来完成业务处理。在分布式架构下，一个服务往往会部署多个实例来运行我们的业务，如果在这种分布式系统环境下运行任务调度，我们称之为**分布式任务调度**。
+
+<div align="center">
+    <img src="截图/分布式任务调度/分布式任务调度.png" alt="分布式任务调度" />
+</div>
+
+将任务调度程序分布式构建，这样就可以具有分布式系统的特点，并且提高任务的调度处理能力：
+
+1、并行任务调度
+
+并行任务调度实现靠多线程，如果有大量任务需要调度，此时光靠多线程就会有瓶颈了，因为一台计算机CPU的处理能力是有限的。
+
+如果将任务调度程序分布式部署，每个结点还可以部署为集群，这样就可以让多台计算机共同去完成任务调度，我们可以将任务分割为若干个分片，由不同的实例并行执行，来提高任务调度的处理效率。
+
+2、高可用
+
+若某一个实例宕机，不影响其他实例来执行任务。
+
+3、弹性扩容
+
+当集群中增加实例就可以提高并执行任务的处理效率。
+
+4、任务管理与监测
+
+对系统中存在的所有定时任务进行统一的管理及监测。让开发人员及运维人员能够时刻了解任务执行情况，从而做出快速的应急处理响应。
+
+**分布式任务调度面临的问题：**
+
+当任务调度以集群方式部署，同一个任务调度可能会执行多次，例如：电商系统定期发放优惠券，就可能重复发放优惠券，对公司造成损失，信用卡还款提醒就会重复执行多次，给用户造成烦恼，所以我们需要控制相同的任务在多个运行实例上只执行一次。常见解决方案：
+
+- 分布式锁，多个实例在任务执行前首先需要获取锁，如果获取失败那么就证明有其他服务已经在运行，如果获取成功那么证明没有服务在运行定时任务，那么就可以执行。
+- ZooKeeper选举，利用ZooKeeper对Leader实例执行定时任务，执行定时任务的时候判断自己是否是Leader，如果不是则不执行，如果是则执行业务逻辑，这样也能达到目的。
+
+#### 4.2 xxl-Job简介
+
+针对分布式任务调度的需求，市场上出现了很多的产品：
+
+1） TBSchedule：淘宝推出的一款非常优秀的高性能分布式调度框架，目前被应用于阿里、京东、支付宝、国美等很多互联网企业的流程调度系统中。但是已经多年未更新，文档缺失严重，缺少维护。
+
+2） XXL-Job：大众点评的分布式任务调度平台，是一个轻量级分布式任务调度平台, 其核心设计目标是开发迅速、学习简单、轻量级、易扩展。现已开放源代码并接入多家公司线上产品线，开箱即用。
+
+3）Elastic-job：当当网借鉴TBSchedule并基于quartz 二次开发的弹性分布式任务调度系统，功能丰富强大，采用zookeeper实现分布式协调，具有任务高可用以及分片功能。
+
+4）Saturn： 唯品会开源的一个分布式任务调度平台，基于Elastic-job，可以全域统一配置，统一监
+控，具有任务高可用以及分片功能。 
+
+XXL-JOB是一个分布式任务调度平台，其核心设计目标是开发迅速、学习简单、轻量级、易扩展。现已开放源代码并接入多家公司线上产品线，开箱即用。
+
+源码地址：https://gitee.com/xuxueli0323/xxl-job
+
+文档地址：https://www.xuxueli.com/xxl-job/
+
+**特性**
+
+- **简单灵活**
+  提供Web页面对任务进行管理，管理系统支持用户管理、权限控制；
+  支持容器部署；
+  支持通过通用HTTP提供跨平台任务调度；
+- **丰富的任务管理功能**
+  支持页面对任务CRUD操作；
+  支持在页面编写脚本任务、命令行任务、Java代码任务并执行；
+  支持任务级联编排，父任务执行结束后触发子任务执行；
+  支持设置指定任务执行节点路由策略，包括轮询、随机、广播、故障转移、忙碌转移等；
+  支持Cron方式、任务依赖、调度中心API接口方式触发任务执行
+- **高性能**
+  任务调度流程全异步化设计实现，如异步调度、异步运行、异步回调等，有效对密集调度进行流量削峰；
+- **高可用**
+  任务调度中心、任务执行节点均 集群部署，支持动态扩展、故障转移
+  支持任务配置路由故障转移策略，执行器节点不可用是自动转移到其他节点执行
+  支持任务超时控制、失败重试配置
+  支持任务处理阻塞策略：调度当任务执行节点忙碌时来不及执行任务的处理策略，包括：串行、抛弃、覆盖策略
+- **易于监控运维**
+  支持设置任务失败邮件告警，预留接口支持短信、钉钉告警；
+  支持实时查看任务执行运行数据统计图表、任务进度监控数据、任务完整执行日志；
+
+#### 4.3 8张表
+
+```java
+- xxl_job_lock：任务调度锁表；
+- xxl_job_group：执行器信息表，维护任务执行器信息；
+- xxl_job_info：调度扩展信息表： 用于保存XXL-JOB调度任务的扩展信息，如任务分组、任务名、机器地址、执行器、执行入参和报警邮件等等；
+- xxl_job_log：调度日志表： 用于保存XXL-JOB任务调度的历史信息，如调度结果、执行结果、调度入参、调度机器和执行器等等；
+- xxl_job_logglue：任务GLUE日志：用于保存GLUE更新历史，用于支持GLUE的版本回溯功能；
+- xxl_job_registry：执行器注册表，维护在线的执行器和调度中心机器地址信息；
+- xxl_job_user：系统用户表；
+```
+
+调度中心支持集群部署，集群情况下各节点务必连接同一个mysql实例;
+
+如果mysql做主从,调度中心集群节点务必强制走主库;
+
+#### 4.4 配置部署调度中心-docker安装
+
+1.创建mysql容器，初始化xxl-job的SQL脚本
+
+```shell
+docker run -p 3306:3306 --name mysql57 \
+-v /opt/mysql/conf:/etc/mysql \
+-v /opt/mysql/logs:/var/log/mysql \
+-v /opt/mysql/data:/var/lib/mysql \
+-e MYSQL_ROOT_PASSWORD=root \
+-d mysql:5.7
+```
+
+2.拉取镜像
+
+```shell
+docker pull xuxueli/xxl-job-admin:2.3.0
+```
+
+3.创建容器
+
+```shell
+docker run -e PARAMS="--spring.datasource.url=jdbc:mysql://192.168.200.130:3306/xxl_job?Unicode=true&characterEncoding=UTF-8 \
+--spring.datasource.username=root \
+--spring.datasource.password=root" \
+-p 8888:8080 -v /tmp:/data/applogs \
+--name xxl-job-admin --restart=always  -d xuxueli/xxl-job-admin:2.3.0
+```
+
+#### 4.5 配置
+
+**基础配置**
+
+- 执行器：每个任务必须绑定一个执行器, 方便给任务进行分组
+
+- 任务描述：任务的描述信息，便于任务管理；
+
+- 负责人：任务的负责人；
+
+- 报警邮件：任务调度失败时邮件通知的邮箱地址，支持配置多邮箱地址，配置多个邮箱地址时用逗号分隔
+
+**调度配置**
+
+- 调度类型：
+  - 无：该类型不会主动触发调度；
+  - CRON：该类型将会通过CRON，触发任务调度；
+  - 固定速度：该类型将会以固定速度，触发任务调度；按照固定的间隔时间，周期性触发；
+
+**任务配置**
+
+- 运行模式：
+
+​    BEAN模式：任务以JobHandler方式维护在执行器端；需要结合 "JobHandler" 属性匹配执行器中任务；
+
+- JobHandler：运行模式为 "BEAN模式" 时生效，对应执行器中新开发的JobHandler类“@JobHandler”注解自定义的value值；
+
+- 执行参数：任务执行所需的参数；
+
+**阻塞处理策略**
+
+阻塞处理策略：调度过于密集执行器来不及处理时的处理策略；
+
+- 单机串行（默认）：调度请求进入单机执行器后，调度请求进入FIFO(First Input First Output)队列并以串行方式运行；
+
+- 丢弃后续调度：调度请求进入单机执行器后，发现执行器存在运行的调度任务，本次请求将会被丢弃并标记为失败；
+
+- 覆盖之前调度：调度请求进入单机执行器后，发现执行器存在运行的调度任务，将会终止运行中的调度任务并清空队列，然后运行本地调度任务；
+
+**路由策略**
+
+当执行器集群部署时，提供丰富的路由策略，包括；
+
+- FIRST（第一个）：固定选择第一个机器；
+
+- LAST（最后一个）：固定选择最后一个机器；
+
+- **ROUND（轮询）**
+
+- RANDOM（随机）：随机选择在线的机器；
+
+- CONSISTENT_HASH（一致性HASH）：每个任务按照Hash算法固定选择某一台机器，且所有任务均匀散列在不同机器上。
+
+- LEAST_FREQUENTLY_USED（最不经常使用）：使用频率最低的机器优先被选举；
+
+- LEAST_RECENTLY_USED（最近最久未使用）：最久未使用的机器优先被选举；
+
+- FAILOVER（故障转移）：按照顺序依次进行心跳检测，第一个心跳检测成功的机器选定为目标执行器并发起调度；
+
+- BUSYOVER（忙碌转移）：按照顺序依次进行空闲检测，第一个空闲检测成功的机器选定为目标执行器并发起调度；
+
+- **SHARDING_BROADCAST(分片广播)：广播触发对应集群中所有机器执行一次任务，同时系统自动传递分片参数；可根据分片参数开发分片任务；**
+
+#### 4.6 路由策略(分片广播)
+
+##### 4.6.1 分片逻辑
+
+执行器集群部署时，任务路由策略选择”分片广播”情况下，一次任务调度将会广播触发对应集群中所有执行器执行一次任务
+
+<div align="center">
+    <img src="截图/分布式任务调度/分片广播.png" alt="分片广播" />
+</div>
+
+### 5. 热点文章-定时计算
+
+#### 5.1 实现思路
+
+<div align="center">
+    <img src="截图/分布式任务调度/实现思路.png" alt="实现思路" />
+</div>
+
+#### 5.2 实现步骤
+
+分值计算不涉及到前端工程，也无需提供api接口，是一个纯后台的功能的开发。
+
+#### 5.3 频道列表远程接口准备
+
+计算完成新热数据后，需要给每个频道缓存一份数据，所以需要查询所有频道信息
+
+① 在heima-leadnews-feign-api定义远程接口
+
+```java
+@FeignClient("leadnews-wemedia")
+public interface IWemediaClient {
+    @GetMapping("/api/v1/channel/list")
+    public ResponseResult getChannels();
+}
+```
+
+② heima-leadnews-wemedia端提供接口
+
+```java
+@RestController
+public class WemediaClient implements IWemediaClient {
+    @Autowired
+    private WmChannelService wmChannelService;
+    
+    @GetMapping("/api/v1/channel/list")
+    @Override
+    public ResponseResult getChannels() {
+        return wmChannelService.findAll();
+    }
+}
+```
+
+在ApArticleMapper.xml新增方法
+
+```xml
+<select id="findArticleListByLast5days" resultMap="resultMap">
+    SELECT
+    aa.*
+    FROM
+    `ap_article` aa
+    LEFT JOIN ap_article_config aac ON aa.id = aac.article_id
+    <where>
+        and aac.is_delete != 1
+        and aac.is_down != 1
+        <if test="dayParam != null">
+            and aa.publish_time <![CDATA[>=]]> #{dayParam}
+        </if>
+    </where>
+</select>
+```
+
+修改ApArticleMapper类
+
+```java
+@Mapper
+public interface ApArticleMapper extends BaseMapper<ApArticle> {
+
+    /**
+     * 加载文章列表
+     * @param dto
+     * @param type  1  加载更多   2记载最新
+     * @return
+     */
+    public List<ApArticle> loadArticleList(ArticleHomeDto dto,Short type);
+	//@Param: 这个注解是为SQL语句中参数赋值而服务的
+    public List<ApArticle> findArticleListByLast5days(@Param("dayParam") Date dayParam);
+}
+```
+
+#### 5.3.4 热文章业务层
+
+修改ArticleConstans
+
+```java
+public class ArticleConstants {
+    public static final Short LOADTYPE_LOAD_MORE = 1;
+    public static final Short LOADTYPE_LOAD_NEW = 2;
+    public static final String DEFAULT_TAG = "__all__";
+
+    public static final String ARTICLE_ES_SYNC_TOPIC = "article.es.sync.topic";
+
+    public static final Integer HOT_ARTICLE_LIKE_WEIGHT = 3;
+    public static final Integer HOT_ARTICLE_COMMENT_WEIGHT = 5;
+    public static final Integer HOT_ARTICLE_COLLECTION_WEIGHT = 8;
+
+    public static final String HOT_ARTICLE_FIRST_PAGE = "hot_article_first_page_";
+}
+```
+
+创建一个vo接收计算分值后的对象
+
+```java
+@Data
+public class HotArticleVo extends ApArticle {
+    /**
+     * 文章分值
+     */
+    private Integer score;
+}
+```
+
+业务层实现类
+
+```java
+@Service
+@Slf4j
+@Transactional
+public class HotArticleServiceImpl implements HotArticleService {
+
+    @Autowired
+    private ApArticleMapper apArticleMapper;
+
+    /**
+     * 计算热点文章
+     */
+    @Override
+    public void computeHotArticle() {
+        //1.查询前5天的文章数据
+        Date dateParam = DateTime.now().minusDays(5).toDate();
+        List<ApArticle> apArticleList = apArticleMapper.findArticleListByLast5days(dateParam);
+
+        //2.计算文章的分值
+        List<HotArticleVo> hotArticleVoList = computeHotArticle(apArticleList);
+
+        //3.为每个频道缓存30条分值较高的文章
+        cacheTagToRedis(hotArticleVoList);
+
+    }
+
+    @Autowired
+    private IWemediaClient wemediaClient;
+
+    @Autowired
+    private CacheService cacheService;
+
+    /**
+     * 为每个频道缓存30条分值较高的文章
+     * @param hotArticleVoList
+     */
+    private void cacheTagToRedis(List<HotArticleVo> hotArticleVoList) {
+        //每个频道缓存30条分值较高的文章
+        ResponseResult responseResult = wemediaClient.getChannels();
+        if(responseResult.getCode().equals(200)){
+            String channelJson = JSON.toJSONString(responseResult.getData());
+            List<WmChannel> wmChannels = JSON.parseArray(channelJson, WmChannel.class);
+            //检索出每个频道的文章
+            if(wmChannels != null && wmChannels.size() > 0){
+                for (WmChannel wmChannel : wmChannels) {
+                    List<HotArticleVo> hotArticleVos = hotArticleVoList.stream().filter(x -> x.getChannelId().equals(wmChannel.getId())).collect(Collectors.toList());
+                    //给文章进行排序，取30条分值较高的文章存入redis  key：频道id   value：30条分值较高的文章
+                    sortAndCache(hotArticleVos, ArticleConstants.HOT_ARTICLE_FIRST_PAGE + wmChannel.getId());
+                }
+            }
+        }
+        //设置推荐数据
+        //给文章进行排序，取30条分值较高的文章存入redis  key：频道id   value：30条分值较高的文章
+        sortAndCache(hotArticleVoList, ArticleConstants.HOT_ARTICLE_FIRST_PAGE+ArticleConstants.DEFAULT_TAG);
+    }
+
+    /**
+     * 排序并且缓存数据
+     * @param hotArticleVos
+     * @param key
+     */
+    private void sortAndCache(List<HotArticleVo> hotArticleVos, String key) {
+        hotArticleVos = hotArticleVos.stream().sorted(Comparator.comparing(HotArticleVo::getScore).reversed()).collect(Collectors.toList());
+        if (hotArticleVos.size() > 30) {
+            hotArticleVos = hotArticleVos.subList(0, 30);
+        }
+        cacheService.set(key, JSON.toJSONString(hotArticleVos));
+    }
+
+    /**
+     * 计算文章分值
+     * @param apArticleList
+     * @return
+     */
+    private List<HotArticleVo> computeHotArticle(List<ApArticle> apArticleList) {
+
+        List<HotArticleVo> hotArticleVoList = new ArrayList<>();
+
+        if(apArticleList != null && apArticleList.size() > 0){
+            for (ApArticle apArticle : apArticleList) {
+                HotArticleVo hot = new HotArticleVo();
+                BeanUtils.copyProperties(apArticle,hot);
+                Integer score = computeScore(apArticle);
+                hot.setScore(score);
+                hotArticleVoList.add(hot);
+            }
+        }
+        return hotArticleVoList;
+    }
+
+    /**
+     * 计算文章的具体分值
+     * @param apArticle
+     * @return
+     */
+    private Integer computeScore(ApArticle apArticle) {
+        Integer scere = 0;
+        if(apArticle.getLikes() != null){
+            scere += apArticle.getLikes() * ArticleConstants.HOT_ARTICLE_LIKE_WEIGHT;
+        }
+        if(apArticle.getViews() != null){
+            scere += apArticle.getViews();
+        }
+        if(apArticle.getComment() != null){
+            scere += apArticle.getComment() * ArticleConstants.HOT_ARTICLE_COMMENT_WEIGHT;
+        }
+        if(apArticle.getCollection() != null){
+            scere += apArticle.getCollection() * ArticleConstants.HOT_ARTICLE_COLLECTION_WEIGHT;
+        }
+
+        return scere;
+    }
+}
+```
+
+在ArticleApplication的引导类中添加以下注解
+
+```java
+@EnableFeignClients(basePackages = "com.heima.apis")
+```
+
+#### 3.3.5 xxl-job定时计算-步骤
+
+①：在heima-leadnews-article中的pom文件中新增依赖
+
+```xml
+<!--xxl-job-->
+<dependency>
+    <groupId>com.xuxueli</groupId>
+    <artifactId>xxl-job-core</artifactId>
+    <version>2.3.0</version>
+</dependency>
+```
+
+② 在xxl-job-admin中新建执行器和任务
+
+新建执行器：leadnews-hot-article-executor
+
+<div align="center">
+    <img src="截图/分布式任务调度/新建执行器.png" alt="新建执行器" />
+</div>
+
+新建任务：路由策略为轮询，Cron表达式：0 0 2 * * ? 
+
+<div align="center">
+    <img src="截图/分布式任务调度/新建执行任务.png" alt="新建执行任务" />
+</div>
+
+③ leadnews-article中集成xxl-job
+
+XxlJobConfig
+
+```java
+/**
+ * xxl-job config
+ *
+ * @author xuxueli 2017-04-28
+ */
+@Configuration
+public class XxlJobConfig {
+    private Logger logger = LoggerFactory.getLogger(XxlJobConfig.class);
+
+    @Value("${xxl.job.admin.addresses}")
+    private String adminAddresses;
+
+    @Value("${xxl.job.executor.appname}")
+    private String appname;
+
+    @Value("${xxl.job.executor.port}")
+    private int port;
+    
+    @Bean
+    public XxlJobSpringExecutor xxlJobExecutor() {
+        logger.info(">>>>>>>>>>> xxl-job config init.");
+        XxlJobSpringExecutor xxlJobSpringExecutor = new XxlJobSpringExecutor();
+        xxlJobSpringExecutor.setAdminAddresses(adminAddresses);
+        xxlJobSpringExecutor.setAppname(appname);
+        xxlJobSpringExecutor.setPort(port);
+        return xxlJobSpringExecutor;
+    }
+}
+```
+
+在nacos配置新增配置
+
+```yaml
+xxl:
+  job:
+    admin:
+      addresses: http://192.168.200.130:8888/xxl-job-admin
+    executor:
+      appname: leadnews-hot-article-executor
+      port: 9999
+```
+
+④：在article微服务中新建任务类
+
+```java
+@Component
+@Slf4j
+public class ComputeHotArticleJob {
+
+    @Autowired
+    private HotArticleService hotArticleService;
+
+    @XxlJob("computeHotArticleJob")
+    public void handle(){
+        log.info("热文章分值计算调度任务开始执行...");
+        hotArticleService.computeHotArticle();
+        log.info("热文章分值计算调度任务结束...");
+
+    }
+}
+```
+
+### 6. 查询文章接口改造
+
+#### 6.1 思路分析
+
+<div align="center">
+    <img src="截图/分布式任务调度/查询文章.png" alt="查询文章" />
+</div>
+
+#### 6.2 核心代码
+
+```java
+/**
+     * 加载文章列表
+     * @param dto
+     * @param type      1 加载更多   2 加载最新
+     * @param firstPage true  是首页  flase 非首页
+     * @return
+     */
+@Override
+public ResponseResult load2(ArticleHomeDto dto, Short type, boolean firstPage) {
+        if(firstPage){
+            String jsonStr = cacheService.get(ArticleConstants.HOT_ARTICLE_FIRST_PAGE + dto.getTag());
+            if(StringUtils.isNotBlank(jsonStr)){
+                List<HotArticleVo> hotArticleVoList = JSON.parseArray(jsonStr, HotArticleVo.class);
+                //没数据的时候redis返回的是 “[]”，此时字符串NotBlank但是没数据
+                if(hotArticleVoList != null && hotArticleVoList.size() > 0){
+                    ResponseResult responseResult = ResponseResult.okResult(hotArticleVoList);
+                    return responseResult;
+                }
+            }
+        }
+        return load(dto, type);
+    }
+```
+
+## 十五、热点文章-实时计算
+
+### 1. 定时计算与实时计算
+
+<div align="center">
+    <img src="截图/热点文章实时计算/定时计算与实时计算.png" alt="定时计算与实时计算" />
+</div>
+
+实时计算
+
+- 用户行为发送消息
+
+- kafkaStream聚合处理消息
+
+- 更新文章行为数量
+
+- 替换热点文章数据
+
+### 2. 实时流式计算
+
+#### 2.1 概念
+
+一般流式计算会与批量计算相比较。在流式计算模型中，输入是持续的，可以认为在时间上是无界的，也就意味着，永远拿不到全量数据去做计算。同时，计算结果是持续输出的，也即计算结果在时间上也是无界的。
+
+流式计算一般对实时性要求较高，同时一般是先定义目标计算，然后数据到来之后将计算逻辑应用于数据。同时为了提高计算效率，往往尽可能采用增量计算代替全量计算。
+
+<div align="center">
+    <img src="截图/热点文章实时计算/概念.png" alt="概念" />
+</div>
+
+流式计算就相当于上图的右侧扶梯，是可以源源不断的产生数据，源源不断的接收数据，没有边界。
+
+#### 2.2 应用场景
+
+- 日志分析
+
+  网站的用户访问日志进行实时的分析，计算访问量，用户画像，留存率等等，实时的进行数据分析，帮助企业进行决策
+
+- 大屏看板统计
+
+  可以实时的查看网站注册数量，订单数量，购买数量，金额等。
+
+- 公交实时数据
+
+  可以随时更新公交车方位，计算多久到达站牌等
+
+- 实时文章分值计算
+
+- 头条类文章的分值计算，通过用户的行为实时文章的分值，分值越高就越被推荐。
+
+#### 2.3 技术方案选型
+
+- Hadoop
+
+<div align="center">
+    <img src="截图/热点文章实时计算/Hadoop.png" alt="Hadoop" />
+</div>
+
+- Apche Storm
+
+  Storm 是一个分布式实时大数据处理系统，可以帮助我们方便地处理海量数据，具有高可靠、高容错、高扩展的特点。是流式框架，有很高的数据吞吐能力。
+
+- Kafka Stream 
+
+  可以轻松地将其嵌入任何Java应用程序中，并与用户为其流应用程序所拥有的任何现有打包，部署和操作工具集成。
+
+### 3. Kafka Stream 
+
+#### 3.1 概述
+
+Kafka Stream是Apache Kafka从0.10版本引入的一个新Feature。它是提供了对存储于Kafka内的数据进行流式处理和分析的功能。
+
+Kafka Stream的特点如下：
+
+- Kafka Stream提供了一个非常简单而轻量的Library，它可以非常方便地嵌入任意Java应用中，也可以任意方式打包和部署
+- 除了Kafka外，无任何外部依赖
+- 充分利用Kafka分区机制实现水平扩展和顺序性保证
+- 通过可容错的state store实现高效的状态操作（如windowed join和aggregation）
+- 支持正好一次处理语义
+- 提供记录级的处理能力，从而实现毫秒级的低延迟
+- 支持基于事件时间的窗口操作，并且可处理晚到的数据（late arrival of records）
+- 同时提供底层的处理原语Processor（类似于Storm的spout和bolt），以及高层抽象的DSL（类似于Spark的map/group/reduce）
+
+<div align="center">
+    <img src="截图/热点文章实时计算/kafka时间窗口.png" alt="kafka时间窗口" />
+</div>
+
+#### 3.2 Kafka Streams的关键概念
+
+- **源处理器（Source Processor）**：源处理器是一个没有任何上游处理器的特殊类型的流处理器。它从一个或多个kafka主题生成输入流。通过消费这些主题的消息并将它们转发到下游处理器。
+- **Sink处理器**：sink处理器是一个没有下游流处理器的特殊类型的流处理器。它接收上游流处理器的消息发送到一个指定的**Kafka主题**。
+
+<div align="center">
+    <img src="截图/热点文章实时计算/关键概念.png" alt="关键概念" />
+</div>
+
+#### 3.3 KStream
+
+（1）数据结构类似于map,如下图，key-value键值对
+
+<div align="center">
+    <img src="截图/热点文章实时计算/KStream数据结构.png" alt="KStream数据结构" />
+</div>
+
+（2）KStream
+
+<div align="center">
+    <img src="截图/热点文章实时计算/KStream新增记录.png" alt="KStream新增记录" />
+</div>
+
+**KStream**数据流（data stream），即是一段顺序的，**可以无限长**，**不断更新的数据集**。
+数据流中比较常记录的是事件，这些事件可以是**一次鼠标点击**（click），**一次交易**，或是**传感器记录的位置**数据。
+
+KStream负责抽象的，就是数据流。与Kafka自身topic中的数据一样，**类似日志**，每一次操作都是**向其中插入（insert）新数据。**
+
+为了说明这一点，让我们想象一下以下两个数据记录正在发送到流中：
+
+（“ alice”，1）->（“” alice“，3）
+
+如果您的流处理应用是要总结每个用户的价值，它将返回`4`了`alice`。为什么？因为第二条数据记录将不被视为先前记录的更新。而是（insert）新数据
+
+#### 3.4 Kafka Stream入门案例编写
+
+##### 3.4.1 需求分析，求单词个数（word count）
+
+<div align="center">
+    <img src="截图/热点文章实时计算/求单词个数.png" alt="求单词个数" />
+</div>
+
+##### 3.4.2 引入依赖
+
+在之前的kafka-demo工程的pom文件中引入
+
+```xml
+<dependency>
+    <groupId>org.apache.kafka</groupId>
+    <artifactId>kafka-streams</artifactId>
+    <exclusions>
+        <exclusion>
+            <artifactId>connect-json</artifactId>
+            <groupId>org.apache.kafka</groupId>
+        </exclusion>
+        <exclusion>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-clients</artifactId>
+        </exclusion>
+    </exclusions>
+</dependency>
+```
+
+##### 3.4.3 创建原生的kafka staream入门案例
+
+```java
+/**
+ * 流式处理
+ */
+public class KafkaStreamQuickStart {
+
+    public static void main(String[] args) {
+
+        //kafka的配置信心
+        Properties prop = new Properties();
+        prop.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG,"192.168.200.130:9092");
+        prop.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        prop.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        prop.put(StreamsConfig.APPLICATION_ID_CONFIG,"streams-quickstart");
+
+        //stream 构建器
+        StreamsBuilder streamsBuilder = new StreamsBuilder();
+
+        //流式计算
+        streamProcessor(streamsBuilder);
+
+
+        //创建kafkaStream对象
+        KafkaStreams kafkaStreams = new KafkaStreams(streamsBuilder.build(),prop);
+        //开启流式计算
+        kafkaStreams.start();
+    }
+
+    /**
+     * 流式计算
+     * 消息的内容：hello kafka  hello itcast
+     * @param streamsBuilder
+     */
+    private static void streamProcessor(StreamsBuilder streamsBuilder) {
+        //创建kstream对象，同时指定从那个topic中接收消息
+        KStream<String, String> stream = streamsBuilder.stream("itcast-topic-input");
+        /**
+         * 处理消息的value
+         */
+        //flatMapValues: ("a", ["x", "y", "z"])->[('a', 'x'), ('a', 'y'), ('a', 'z')]
+        stream.flatMapValues(new ValueMapper<String, Iterable<String>>() {
+            @Override
+            public Iterable<String> apply(String value) {
+                return Arrays.asList(value.split(" "));
+            }
+        })
+                //按照value进行分组
+                .groupBy((key,value)->value)
+                //时间窗口
+                .windowedBy(TimeWindows.of(Duration.ofSeconds(10)))
+                //统计单词的个数，(key,value)->(value,count(value))
+                .count()
+                //转换为kStream
+                .toStream()
+                .map((key,value)->{
+                    System.out.println("key:"+key+",vlaue:"+value);
+                    return new KeyValue<>(key.key().toString(),value.toString());
+                })
+                //发送消息
+                .to("itcast-topic-out");
+    }
+}
+```
+
+(4)测试准备
+
+- 使用生产者在topic为：itcast_topic_input中发送多条消息
+
+- 使用消费者接收topic为：itcast_topic_out
+
+结果：
+
+- 通过流式计算，会把生产者的多条消息汇总成一条发送到消费者中输出
+
+#### 3.5 SpringBoot集成Kafka Stream
+
+##### 3.5.1 自定配置参数
+
+```java
+/**
+ * 通过重新注册KafkaStreamsConfiguration对象，设置自定配置参数
+ */
+@Setter
+@Getter
+@Configuration
+@EnableKafkaStreams  
+@ConfigurationProperties(prefix="kafka")
+public class KafkaStreamConfig {
+    private static final int MAX_MESSAGE_SIZE = 16* 1024 * 1024;
+    private String hosts;
+    private String group;
+    @Bean(name = KafkaStreamsDefaultConfiguration.DEFAULT_STREAMS_CONFIG_BEAN_NAME)
+    public KafkaStreamsConfiguration defaultKafkaStreamsConfig() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, hosts);
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, this.getGroup()+"_stream_aid");
+        props.put(StreamsConfig.CLIENT_ID_CONFIG, this.getGroup()+"_stream_cid");
+        props.put(StreamsConfig.RETRIES_CONFIG, 10);
+        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        return new KafkaStreamsConfiguration(props);
+    }
+}
+```
+
+修改application.yml文件，在最下方添加自定义配置
+
+```yaml
+kafka:
+  hosts: 192.168.200.130:9092
+  group: ${spring.application.name}
+```
+
+(2)新增配置类，创建KStream对象，进行聚合
+
+```java
+//标记这个类是一个Spring配置类，Spring容器会在这个类中查找带有@Bean注解的方法，并将它们注册为Spring应用上下文中的bean
+@Configuration
+@Slf4j
+public class KafkaStreamHelloListener {
+
+    @Bean
+    public KStream<String,String> kStream(StreamsBuilder streamsBuilder){
+        //创建kstream对象，同时指定从那个topic中接收消息
+        KStream<String, String> stream = streamsBuilder.stream("itcast-topic-input");
+        stream.flatMapValues(new ValueMapper<String, Iterable<String>>() {
+            @Override
+            public Iterable<String> apply(String value) {
+                return Arrays.asList(value.split(" "));
+            }
+        })
+                //根据value进行聚合分组
+                .groupBy((key,value)->value)
+                //聚合计算时间间隔
+                .windowedBy(TimeWindows.of(Duration.ofSeconds(10)))
+                //求单词的个数
+                .count()
+                .toStream()
+                //处理后的结果转换为string字符串
+                .map((key,value)->{
+                    System.out.println("key:"+key+",value:"+value);
+                    return new KeyValue<>(key.key().toString(),value.toString());
+                })
+                //发送消息
+                .to("itcast-topic-out");
+        return stream;
+    }
+}
+```
+
+测试：
+
+​	启动微服务，正常发送消息，可以正常接收到消息
+
+### 4. app端热点文章计算
+
+#### 4.1 思路说明
+
+<div align="center">
+    <img src="截图/热点文章实时计算/app端热点文章计算.png" alt="app端热点文章计算" />
+</div>
+
+#### 4.2 功能实现
+
+##### 4.2.1 用户行为（阅读量，评论，点赞，收藏）发送消息，以阅读和点赞为例
+
+①在heima-leadnews-behavior微服务中集成kafka生产者配置
+
+修改nacos，新增内容
+
+```yaml
+spring:
+  application:
+    name: leadnews-behavior
+  kafka:
+    bootstrap-servers: 192.168.200.130:9092
+    producer:
+      retries: 10
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+```
+
+②修改ApLikesBehaviorServiceImpl新增发送消息
+
+定义消息发送封装类：UpdateArticleMess
+
+```java
+@Data
+public class UpdateArticleMess {
+
+    /**
+     * 修改文章的字段类型
+      */
+    private UpdateArticleType type;
+    /**
+     * 文章ID
+     */
+    private Long articleId;
+    /**
+     * 修改数据的增量，可为正负
+     */
+    private Integer add;
+
+    public enum UpdateArticleType{
+        COLLECTION,COMMENT,LIKES,VIEWS;
+    }
+}
+```
+
+topic常量类：
+
+```java
+public class HotArticleConstants {
+
+    public static final String HOT_ARTICLE_SCORE_TOPIC="hot.article.score.topic";
+   
+}
+```
+
+完整代码如下：
+
+```java
+@Service
+@Transactional
+@Slf4j
+public class ApLikesBehaviorServiceImpl implements ApLikesBehaviorService {
+
+    @Autowired
+    private CacheService cacheService;
+
+    @Autowired
+    private KafkaTemplate<String,String> kafkaTemplate;
+
+    @Override
+    public ResponseResult like(LikesBehaviorDto dto) {
+
+        //1.检查参数
+        if (dto == null || dto.getArticleId() == null || checkParam(dto)) {
+            return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID);
+        }
+
+        //2.是否登录
+        ApUser user = AppThreadLocalUtil.getUser();
+        if (user == null) {
+            return ResponseResult.errorResult(AppHttpCodeEnum.NEED_LOGIN);
+        }
+
+        UpdateArticleMess mess = new UpdateArticleMess();
+        mess.setArticleId(dto.getArticleId());
+        mess.setType(UpdateArticleMess.UpdateArticleType.LIKES);
+
+        //3.点赞  保存数据
+        if (dto.getOperation() == 0) {
+            Object obj = cacheService.hGet(BehaviorConstants.LIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+            if (obj != null) {
+                return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID, "已点赞");
+            }
+            // 保存当前key
+            log.info("保存当前key:{} ,{}, {}", dto.getArticleId(), user.getId(), dto);
+            cacheService.hPut(BehaviorConstants.LIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString(), JSON.toJSONString(dto));
+            mess.setAdd(1);
+        } else {
+            // 删除当前key
+            log.info("删除当前key:{}, {}", dto.getArticleId(), user.getId());
+            cacheService.hDelete(BehaviorConstants.LIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+            mess.setAdd(-1);
+        }
+
+        //发送消息，数据聚合
+        kafkaTemplate.send(HotArticleConstants.HOT_ARTICLE_SCORE_TOPIC,JSON.toJSONString(mess));
+
+        return ResponseResult.okResult(AppHttpCodeEnum.SUCCESS);
+    }
+
+    /**
+     * 检查参数
+     * @return
+     */
+    private boolean checkParam(LikesBehaviorDto dto) {
+        if (dto.getType() > 2 || dto.getType() < 0 || dto.getOperation() > 1 || dto.getOperation() < 0) {
+            return true;
+        }
+        return false;
+    }
+}
+```
+
+③修改阅读行为的类ApReadBehaviorServiceImpl发送消息
+
+完整代码：
+
+```java
+@Service
+@Transactional
+@Slf4j
+public class ApReadBehaviorServiceImpl implements ApReadBehaviorService {
+
+    @Autowired
+    private CacheService cacheService;
+
+    @Autowired
+    private KafkaTemplate<String,String> kafkaTemplate;
+
+    @Override
+    public ResponseResult readBehavior(ReadBehaviorDto dto) {
+        //1.检查参数
+        if (dto == null || dto.getArticleId() == null) {
+            return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID);
+        }
+
+        //2.是否登录
+        ApUser user = AppThreadLocalUtil.getUser();
+        if (user == null) {
+            return ResponseResult.errorResult(AppHttpCodeEnum.NEED_LOGIN);
+        }
+        //更新阅读次数
+        String readBehaviorJson = (String) cacheService.hGet(BehaviorConstants.READ_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+        if (StringUtils.isNotBlank(readBehaviorJson)) {
+            ReadBehaviorDto readBehaviorDto = JSON.parseObject(readBehaviorJson, ReadBehaviorDto.class);
+            dto.setCount((short) (readBehaviorDto.getCount() + dto.getCount()));
+        }
+        // 保存当前key
+        log.info("保存当前key:{} {} {}", dto.getArticleId(), user.getId(), dto);
+        cacheService.hPut(BehaviorConstants.READ_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString(), JSON.toJSONString(dto));
+
+        //发送消息，数据聚合
+        UpdateArticleMess mess = new UpdateArticleMess();
+        mess.setArticleId(dto.getArticleId());
+        mess.setType(UpdateArticleMess.UpdateArticleType.VIEWS);
+        mess.setAdd(1);
+        kafkaTemplate.send(HotArticleConstants.HOT_ARTICLE_SCORE_TOPIC,JSON.toJSONString(mess));
+        
+        return ResponseResult.okResult(AppHttpCodeEnum.SUCCESS);
+    }
+}
+```
+
+##### 4.2.2 使用kafkaStream实时接收消息，聚合内容
+
+①在leadnews-article微服务中集成kafkaStream (参考kafka-demo)
+
+②定义实体类，用于聚合之后的分值封装
+
+```java
+@Data
+public class ArticleVisitStreamMess {
+    /**
+     * 文章id
+     */
+    private Long articleId;
+    /**
+     * 阅读
+     */
+    private int view;
+    /**
+     * 收藏
+     */
+    private int collect;
+    /**
+     * 评论
+     */
+    private int comment;
+    /**
+     * 点赞
+     */
+    private int like;
+}
+```
+
+修改常量类：增加常量
+
+```java
+public class HotArticleConstants {
+
+    public static final String HOT_ARTICLE_SCORE_TOPIC="hot.article.score.topic";
+    public static final String HOT_ARTICLE_INCR_HANDLE_TOPIC="hot.article.incr.handle.topic";
+}
+```
+
+③ 定义stream,接收消息并聚合
+
+```java
+@Configuration
+@Slf4j
+public class HotArticleStreamHandler {
+
+    @Bean
+    public KStream<String,String> kStream(StreamsBuilder streamsBuilder){
+        //接收消息
+        KStream<String,String> stream = streamsBuilder.stream(HotArticleConstants.HOT_ARTICLE_SCORE_TOPIC);
+        //聚合流式处理
+        stream.map((key,value)->{
+            UpdateArticleMess mess = JSON.parseObject(value, UpdateArticleMess.class);
+            //重置消息的key:1234343434   和  value: likes:1
+            return new KeyValue<>(mess.getArticleId().toString(),mess.getType().name()+":"+mess.getAdd());
+        })
+                //按照文章id进行分组
+                .groupBy((key,value)->key)
+                //时间窗口
+                .windowedBy(TimeWindows.of(Duration.ofSeconds(10)))
+                /**
+                 * 自行的完成聚合的计算
+                 */
+                .aggregate(new Initializer<String>() {
+                    /**
+                     * 初始方法，返回值是消息的value
+                     * 这个初始值表示了聚合操作的起点，即在没有任何数据流入时，聚合结果应该是什么样子的
+                     * 该方法只会在一开始调用一次
+                     * @return
+                     */
+                    @Override
+                    public String apply() {
+                        return "COLLECTION:0,COMMENT:0,LIKES:0,VIEWS:0";
+                    }
+                    /**
+                     * 真正的聚合操作，返回值是消息的value
+                     * <String,String,String>分别表示键（Key）、值（Value）和聚合结果（Aggregated Value）
+                     * 聚合器会根据输入的数据值和当前的聚合结果来计算出一个新的聚合结果。
+                     * 也就是聚合结果又作为下一轮的第三个String参数
+                     */
+                }, new Aggregator<String, String, String>() {
+                    @Override
+                    public String apply(String key, String value, String aggValue) {
+                        if(StringUtils.isBlank(value)){
+                            return aggValue;
+                        }
+                        String[] aggAry = aggValue.split(",");
+                        int col = 0,com=0,lik=0,vie=0;
+                        for (String agg : aggAry) {
+                            String[] split = agg.split(":");
+                            /**
+                             * 获得上一轮聚合的结果，也是时间窗口内计算之后的值
+                             */
+                            switch (UpdateArticleMess.UpdateArticleType.valueOf(split[0])){
+                                case COLLECTION:
+                                    col = Integer.parseInt(split[1]);
+                                    break;
+                                case COMMENT:
+                                    com = Integer.parseInt(split[1]);
+                                    break;
+                                case LIKES:
+                                    lik = Integer.parseInt(split[1]);
+                                    break;
+                                case VIEWS:
+                                    vie = Integer.parseInt(split[1]);
+                                    break;
+                            }
+                        }
+                        /**
+                         * 累加操作
+                         */
+                        String[] valAry = value.split(":");
+                        switch (UpdateArticleMess.UpdateArticleType.valueOf(valAry[0])){
+                            case COLLECTION:
+                                col += Integer.parseInt(valAry[1]);
+                                break;
+                            case COMMENT:
+                                com += Integer.parseInt(valAry[1]);
+                                break;
+                            case LIKES:
+                                lik += Integer.parseInt(valAry[1]);
+                                break;
+                            case VIEWS:
+                                vie += Integer.parseInt(valAry[1]);
+                                break;
+                        }
+
+                        String formatStr = String.format("COLLECTION:%d,COMMENT:%d,LIKES:%d,VIEWS:%d", col, com, lik, vie);
+                        System.out.println("文章的id:"+key);
+                        System.out.println("当前时间窗口内的消息处理结果："+formatStr);
+                        return formatStr;
+                    }
+                }, Materialized.as("hot-atricle-stream-count-001"))//将流处理的结果物化（即保存为状态，可以持久化也可以仅在内存中）
+                .toStream()
+                .map((key,value)->{
+                    return new KeyValue<>(key.key().toString(),formatObj(key.key().toString(),value));
+                })
+                //发送消息
+                .to(HotArticleConstants.HOT_ARTICLE_INCR_HANDLE_TOPIC);
+
+        return stream;
+    }
+
+    /**
+     * 格式化消息的value数据
+     * @param articleId
+     * @param value
+     * @return
+     */
+    public String formatObj(String articleId,String value){
+        ArticleVisitStreamMess mess = new ArticleVisitStreamMess();
+        mess.setArticleId(Long.valueOf(articleId));
+        //COLLECTION:0,COMMENT:0,LIKES:0,VIEWS:0
+        String[] valAry = value.split(",");
+        for (String val : valAry) {
+            String[] split = val.split(":");
+            switch (UpdateArticleMess.UpdateArticleType.valueOf(split[0])){
+                case COLLECTION:
+                    mess.setCollect(Integer.parseInt(split[1]));
+                    break;
+                case COMMENT:
+                    mess.setComment(Integer.parseInt(split[1]));
+                    break;
+                case LIKES:
+                    mess.setLike(Integer.parseInt(split[1]));
+                    break;
+                case VIEWS:
+                    mess.setView(Integer.parseInt(split[1]));
+                    break;
+            }
+        }
+        log.info("聚合消息处理之后的结果为:{}",JSON.toJSONString(mess));
+        return JSON.toJSONString(mess);
+    }
+}
+```
+
+##### 4.2.3 重新计算文章的分值，更新到数据库和缓存中
+
+①在ApArticleService添加方法，用于更新数据库中的文章分值
+
+```java
+/**
+     * 更新文章的分值  同时更新缓存中的热点文章数据
+     * @param mess
+     */
+public void updateScore(ArticleVisitStreamMess mess);
+```
+
+实现类方法
+
+```java
+/**
+     * 更新文章的分值  同时更新缓存中的热点文章数据
+     * @param mess
+     */
+@Override
+public void updateScore(ArticleVisitStreamMess mess) {
+    //1.更新文章的阅读、点赞、收藏、评论的数量
+    ApArticle apArticle = updateArticle(mess);
+    //2.计算文章的分值
+    Integer score = computeScore(apArticle);
+    score = score * 3;
+
+    //3.替换当前文章对应频道的热点数据
+    replaceDataToRedis(apArticle, score, ArticleConstants.HOT_ARTICLE_FIRST_PAGE + apArticle.getChannelId());
+
+    //4.替换推荐对应的热点数据
+    replaceDataToRedis(apArticle, score, ArticleConstants.HOT_ARTICLE_FIRST_PAGE + ArticleConstants.DEFAULT_TAG);
+
+}
+
+/**
+     * 替换数据并且存入到redis
+     * @param apArticle
+     * @param score
+     * @param s
+     */
+private void replaceDataToRedis(ApArticle apArticle, Integer score, String s) {
+    String articleListStr = cacheService.get(s);
+    if (StringUtils.isNotBlank(articleListStr)) {
+        List<HotArticleVo> hotArticleVoList = JSON.parseArray(articleListStr, HotArticleVo.class);
+
+        boolean flag = true;
+
+        //如果缓存中存在该文章，只更新分值
+        for (HotArticleVo hotArticleVo : hotArticleVoList) {
+            if (hotArticleVo.getId().equals(apArticle.getId())) {
+                hotArticleVo.setScore(score);
+                flag = false;
+                break;
+            }
+        }
+
+        //如果缓存中不存在，查询缓存中分值最小的一条数据，进行分值的比较，如果当前文章的分值大于缓存中的数据，就替换
+        if (flag) {
+            if (hotArticleVoList.size() >= 30) {
+                hotArticleVoList = hotArticleVoList.stream().sorted(Comparator.comparing(HotArticleVo::getScore).reversed()).collect(Collectors.toList());
+                HotArticleVo lastHot = hotArticleVoList.get(hotArticleVoList.size() - 1);
+                if (lastHot.getScore() < score) {
+                    hotArticleVoList.remove(lastHot);
+                    HotArticleVo hot = new HotArticleVo();
+                    BeanUtils.copyProperties(apArticle, hot);
+                    hot.setScore(score);
+                    hotArticleVoList.add(hot);
+                }
+
+
+            } else {
+                HotArticleVo hot = new HotArticleVo();
+                BeanUtils.copyProperties(apArticle, hot);
+                hot.setScore(score);
+                hotArticleVoList.add(hot);
+            }
+        }
+        //缓存到redis
+        hotArticleVoList = hotArticleVoList.stream().sorted(Comparator.comparing(HotArticleVo::getScore).reversed()).collect(Collectors.toList());
+        cacheService.set(s, JSON.toJSONString(hotArticleVoList));
+    }
+}
+
+/**
+     * 更新文章行为数量
+     * @param mess
+     */
+private ApArticle updateArticle(ArticleVisitStreamMess mess) {
+    ApArticle apArticle = getById(mess.getArticleId());
+    //这里是get apArticle的，也就是get数据库的，如果数据库为null，当然要设置为0
+    apArticle.setCollection(apArticle.getCollection()==null?0:apArticle.getCollection()+mess.getCollect());
+    apArticle.setComment(apArticle.getComment()==null?0:apArticle.getComment()+mess.getComment());
+    apArticle.setLikes(apArticle.getLikes()==null?0:apArticle.getLikes()+mess.getLike());
+    apArticle.setViews(apArticle.getViews()==null?0:apArticle.getViews()+mess.getView());
+    updateById(apArticle);
+    return apArticle;
+}
+
+/**
+     * 计算文章的具体分值
+     * @param apArticle
+     * @return
+     */
+private Integer computeScore(ApArticle apArticle) {
+    Integer score = 0;
+    if(apArticle.getLikes() != null){
+        score += apArticle.getLikes() * ArticleConstants.HOT_ARTICLE_LIKE_WEIGHT;
+    }
+    if(apArticle.getViews() != null){
+        score += apArticle.getViews();
+    }
+    if(apArticle.getComment() != null){
+        score += apArticle.getComment() * ArticleConstants.HOT_ARTICLE_COMMENT_WEIGHT;
+    }
+    if(apArticle.getCollection() != null){
+        score += apArticle.getCollection() * ArticleConstants.HOT_ARTICLE_COLLECTION_WEIGHT;
+    }
+
+    return score;
+}
+```
+
+②定义监听，接收聚合之后的数据，文章的分值重新进行计算
+
+```java
+@Component
+@Slf4j
+public class ArticleIncrHandleListener {
+
+    @Autowired
+    private ApArticleService apArticleService;
+
+    @KafkaListener(topics = HotArticleConstants.HOT_ARTICLE_INCR_HANDLE_TOPIC)
+    public void onMessage(String mess){
+        if(StringUtils.isNotBlank(mess)){
+            ArticleVisitStreamMess articleVisitStreamMess = JSON.parseObject(mess, ArticleVisitStreamMess.class);
+            apArticleService.updateScore(articleVisitStreamMess);
+        }
+    }
+}
+```
+
+## 十六、项目部署_持续集成
+
+### 1.概念
+
+#### 1.1 什么是持续集成
+
+持续集成（ Continuous integration ， 简称 CI ）指的是，频繁地（一天多次）将代码集成到主干
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/概念.png" alt="概念" />
+</div>
+
+**持续集成的组成要素**
+
+一个自动构建过程， 从检出代码、 编译构建、 运行测试、 结果记录、 测试统计等都是自动完成的， 无需人工干预。
+
+一个代码存储库，即需要版本控制软件来保障代码的可维护性，同时作为构建过程的素材库，一般使用SVN或Git。
+
+一个持续集成服务器， Jenkins 就是一个配置简单和使用方便的持续集成服务器。
+
+#### 1.2 持续集成的好处
+
+1、降低风险，由于持续集成不断去构建，编译和测试，可以很早期发现问题，所以修复的代价就少；
+2、对系统健康持续检查，减少发布风险带来的问题；
+3、减少重复性工作；
+4、持续部署，提供可部署单元包；
+5、持续交付可供使用的版本；
+6、增强团队信心；
+
+### 2. 软件开发模式
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/软件开发模式.png" alt="软件开发模式" />
+</div>
+
+#### 2.1 软件开发生命周期
+
+软件开发生命周期又叫做SDLC（Software Development Life Cycle），它是集合了计划、开发、测试和部署过程的集合。如下图所示 ：
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/软件开发生命周期.png" alt="软件开发生命周期" />
+</div>
+
+- 需求分析
+
+  这是生命周期的第一阶段，根据项目需求，团队执行一个可行性计划的分析。项目需求可能是公司内部或者客户提出的。这阶段主要是对信息的收集，也有可能是对现有项目的改善和重新做一个新的项目。还要分析项目的预算多长，可以从哪方面受益及布局，这也是项目创建的目标。
+
+- 设计
+
+  第二阶段就是设计阶段，系统架构和满意状态（就是要做成什么样子，有什么功能），和创建一个项目计划。计划可以使用图表，布局设计或者文字的方式呈现。
+
+- 实现
+
+  第三阶段就是实现阶段，项目经理创建和分配工作给开者，开发者根据任务和在设计阶段定义的目标进行开发代码。依据项目的大小和复杂程度，可以需要数月或更长时间才能完成。
+
+- 测试
+
+  测试人员进行代码测试 ，包括功能测试、代码测试、压力测试等。
+
+- 进化
+
+  最后阶段就是对产品不断的进化改进和维护阶段，根据用户的使用情况，可能需要对某功能进行修改，bug修复，功能增加等。
+
+#### 2.2 软件开发瀑布模型
+
+瀑布模型是最著名和最常使用的软件开发模型。瀑布模型就是一系列的软件开发过程。它是由制造业繁衍出来的。一个高度化的结构流程在一个方向上流动，有点像生产线一样。在瀑布模型创建之初，没有其它开发的模型，有很多东西全靠开发人员去猜测，去开发。这样的模型仅适用于那些简单的软件开发， 但是已经不适合现在的开发了。
+
+下图对软件开发模型的一个阐述。
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/瀑布模型.png" alt="瀑布模型" />
+</div>
+
+
+
+| 优势                                       | 劣势                                                         |
+| ------------------------------------------ | ------------------------------------------------------------ |
+| 简单易用和理解                             | 各个阶段的划分完全固定，阶段之间产生大量的文档，极大地增加了工作量。 |
+| 当前一阶段完成后，您只需要去关注后续阶段。 | 由于开发模型是线性的，用户只有等到整个过程的末期才能见到开发成果，从而增加了开发风险。 |
+| 为项目提供了按阶段划分的检查节点           | 瀑布模型的突出缺点是不适应用户需求的变化。                   |
+
+#### 2.3 软件的敏捷开发
+
+- 什么是敏捷开发？
+
+  敏捷开发（Agile Development） 的核心是迭代开发（Iterative Development） 与 增量开发（Incremental Development）。
+
+- 何为迭代开发？
+
+  对于大型软件项目，传统的开发方式是采用一个大周期（比如一年）进行开发，整个过程就是一次"大开发"；迭代开发的方式则不一样，它将开发过程拆分成多个小周期，即一次"大开发"变成多次"小开发"，每次小开发都是同样的流程，所以看上去就好像重复在做同样的步骤。
+
+  举例来说，SpaceX 公司想造一个大推力火箭，将人类送到火星。但是，它不是一开始就造大火箭，而是先造一个最简陋的小火箭 Falcon 1。结果，第一次发射就爆炸了，直到第四次发射，才成功进入轨道。然后，开发了中型火箭 Falcon 9，九年中发射了70次。最后，才开发 Falcon 重型火箭。如果SpaceX 不采用迭代开发，它可能直到现在还无法上天。
+
+- 何为增量开发？
+
+  软件的每个版本，都会新增一个用户可以感知的完整功能。也就是说，按照新增功能来划分迭代。
+
+  举例来说，房产公司开发一个10栋楼的小区。如果采用增量开发的模式，该公司第一个迭代就是交付一号楼，第二个迭代交付二号楼......每个迭代都是完成一栋完整的楼。而不是第一个迭代挖好10栋楼的地基，第二个迭代建好每栋楼的骨架，第三个迭代架设屋顶......
+
+- 敏捷开发如何迭代？
+
+  虽然敏捷开发将软件开发分成多个迭代，但是也要求，每次迭代都是一个完整的软件开发周期，必须按照软件工程的方法论，进行正规的流程管理。
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/敏捷开发.png" alt="敏捷开发" />
+</div>
+
+敏捷开发有什么好处？
+
+- 早期交付
+
+  敏捷开发的第一个好处，就是早期交付，从而大大降低成本。 还是以房产公司为例，如果按照传统的"瀑布开发模式"，先挖10栋楼的地基、再盖骨架、然后架设屋顶，每个阶段都等到前一个阶段完成后开始，可能需要两年才能一次性交付10栋楼。也就是说，如果不考虑预售，该项目必须等到两年后才能回款。 敏捷开发是六个月后交付一号楼，后面每两个月交付一栋楼。因此，半年就能回款10%，后面每个月都会有现金流，资金压力就大大减轻了。
+
+- 降低风险
+
+  敏捷开发的第二个好处是，及时了解市场需求，降低产品不适用的风险。 请想一想，哪一种情况损失比较小：10栋楼都造好以后，才发现卖不出去，还是造好第一栋楼，就发现卖不出去，从而改进或停建后面9栋楼？
+
+### 3. Jenkins安装配置
+
+#### 3.1 Jenkins介绍
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/Jenkins.png" alt="Jenkins" />
+</div>
+
+Jenkins  是一款流行的开源持续集成（Continuous Integration）工具，广泛用于项目开发，具有自动化构建、测试和部署等功能。官网：  http://jenkins-ci.org/。
+
+Jenkins的特征：
+
+- 开源的 Java语言开发持续集成工具，支持持续集成，持续部署。
+- 易于安装部署配置：可通过 yum安装,或下载war包以及通过docker容器等快速实现安装部署，可方便web界面配置管理。
+- 消息通知及测试报告：集成 RSS/E-mail通过RSS发布构建结果或当构建完成时通过e-mail通知，生成JUnit/TestNG测试报告。
+- 分布式构建：支持 Jenkins能够让多台计算机一起构建/测试。
+- 文件识别： Jenkins能够跟踪哪次构建生成哪些jar，哪次构建使用哪个版本的jar等。
+- 丰富的插件支持：支持扩展插件，你可以开发适合自己团队使用的工具，如 git，svn，maven，docker等。
+
+
+
+Jenkins安装和持续集成环境配置
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/流程.png" alt="流程" />
+</div>
+
+1 ）首先，开发人员每天进行代码提交，提交到Git仓库
+
+2）然后，Jenkins作为持续集成工具，使用Git工具到Git仓库拉取代码到集成服务器，再配合JDK，Maven等软件完成代码编译，代码测试与审查，测试，打包等工作，在这个过程中每一步出错，都重新再执行一次整个流程。
+
+3）最后，Jenkins把生成的jar或war包分发到测试服务器或者生产服务器，测试人员或用户就可以访问应用。
+
+#### 3.2 Jenkins环境搭建
+
+##### 3.2.1  Jenkins安装配置
+
+如果启动失败， 出现错误信息：
+
+```
+Starting Jenkins bash: /usr/bin/java: No such file or directory
+```
+
+创建JAVA环境的软链接：
+
+```
+ln -s /usr/local/jdk/bin/java /usr/bin/java
+```
+
+软连接的应用场景：下载的东西（Java）在一个文件中，而某个（Jenkins）要的这个东西（Java）必须在指定的另一个文件，此时就可以通过软连接的方式。
+
+##### 3.2.2  Jenkins插件安装
+
+在实现持续集成之前， 需要确保以下插件安装成功。
+
+- Maven Integration plugin： Maven 集成管理插件。
+- Docker plugin： Docker集成插件。
+- GitLab Plugin： GitLab集成插件。
+- Publish Over SSH：远程文件发布插件。
+- SSH: 远程脚本执行插件。
+
+勾选插件， 点击直接安装即可。
+
+>注意，如果没有安装按钮，需要更改配置
+>
+>在安装插件的高级配置中，修改升级站点的连接为：http://updates.jenkins.io/update-center.json   保存
+
+Docker
+
+设置开机启动：
+
+```sh
+systemctl enable docker
+```
+
+启动docker
+
+```sh
+systemctl start docker
+```
+
+### 4. 后端项目部署
+
+#### 4.1 多环境切换-微服务中多环境配置
+
+在项目开发部署的过程中，一般都会有三套项目环境
+
+- Development ：开发环境
+
+- Production ：生产环境
+
+- Test ：测试环境
+
+例如：开发环境的mysql连接的是本地，生产环境需要连接线上的mysql环境
+
+在nacos的配置中心中新增各个环境的配置文件，例如user微服务中新增
+
+修改bootstrap.yml 添加内容
+
+```properties
+spring:
+  profiles:
+    active: dev
+```
+
+创建对应的nacos的多环境配置：
+
+注意事项：
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/多环境配置.png" alt="多环境配置" />
+</div>
+
+其中DataID属性命名有规范：
+
+- prefix，默认使用${spring.application.name}，也可以通过spring.cloud.nacos.config.prefix来配置。
+- spring.profile.active，即为当前环境对应的 profile，详情可以参考 Spring Boot文档。 注意：当 spring.profile.active 为空时，对应的连接符 - 也将不存在，dataId 的拼接格式变成 ${prefix}.${file-extension}
+- file-exetension，为配置内容的数据格式，可以通过配置项 spring.cloud.nacos.config.file-extension 来配置。目前只支持 properties 和 yaml 类型。
+
+#### 4.2 整体思路
+
+目标：把黑马头条的app端相关的微服务部署到192.168.200.100这台服务器上
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/整体思路.png" alt="整体思路" />
+</div>
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/注意事项.png" alt="注意事项" />
+</div>
+
+#### 4.3 服务集成Docker配置
+
+目标：部署的每一个微服务都是先创建docker镜像后创建对应容器启动
+
+方式一：本地微服务打包以后上传到服务器，编写Dockerfile文件完成。
+
+方式二：使用dockerfile-maven-plugin插件，可以直接把微服务创建为镜像使用（更省事）
+
+**服务集成Docker配置**
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/服务集成Docker配置.png" alt="服务集成Docker配置" />
+</div>
+
+每个微服务都引入该依赖,以heima-leadnews-user微服务为例
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <parent>
+        <artifactId>heima-leadnews-service</artifactId>
+        <groupId>com.heima</groupId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+    <modelVersion>4.0.0</modelVersion>
+
+    <artifactId>heima-leadnews-user</artifactId>
+
+    <properties>
+        <maven.compiler.source>8</maven.compiler.source>
+        <maven.compiler.target>8</maven.compiler.target>
+        <docker.image>docker_storage</docker.image>
+    </properties>
+
+    <build>
+        <finalName>heima-leadnews-user</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.7.0</version>
+                <configuration>
+                    <source>${java.version}</source>
+                    <target>${java.version}</target>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>com.spotify</groupId>
+                <artifactId>dockerfile-maven-plugin</artifactId>
+                <version>1.3.6</version>
+                <configuration>
+                    <repository>${docker.image}/${project.artifactId}</repository>
+                    <buildArgs>
+                        <JAR_FILE>target/${project.build.finalName}.jar</JAR_FILE>
+                    </buildArgs>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>
+```
+
+**服务集成Dockerfile文件**
+
+```dockerfile
+# 设置JAVA版本
+FROM java:8
+# 指定存储卷, 任何向/tmp写入的信息都不会记录到容器存储层
+VOLUME /tmp
+# 拷贝运行JAR包
+ARG JAR_FILE
+COPY ${JAR_FILE} app.jar
+# 设置JVM运行参数， 这里限定下内存大小，减少开销
+ENV JAVA_OPTS="\
+-server \
+-Xms256m \
+-Xmx512m \
+-XX:MetaspaceSize=256m \
+-XX:MaxMetaspaceSize=512m"
+#空参数，方便创建容器时传参
+ENV PARAMS=""
+# 入口点， 执行JAVA运行命令
+ENTRYPOINT ["sh","-c","java -jar $JAVA_OPTS /app.jar $PARAMS"]
+```
+
+#### 4.4 jenkins微服务打包配置
+
+所有微服务打包的方式类似，以heima-leadnews-user微服务为例
+
+1. 新建任务
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/新建任务.png" alt="新建任务" />
+</div>
+
+2. 找到自己指定的git仓库，设置用户名和密码
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/Git.png" alt="Git" />
+</div>
+
+3. 执行maven命令
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/Maven.png" alt="Maven" />
+</div>
+
+
+
+```java
+clean install -Dmaven.test.skip=true  dockerfile:build -f heima-leadnews/heima-leadnews-service/heima-leadnews-user/pom.xml
+```
+
+<font color='red'>注意：根据自己的实际代码路径配置</font>
+
+-Dmaven.test.skip=true  跳过测试
+
+dockerfile:build 启动dockerfile插件构建容器
+
+-f heima-leadnews-user/pom.xml 指定需要构建的文件（必须是pom）
+
+4. 并执行shell脚本
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/shell.png" alt="shell" />
+</div>
+
+```java
+if [ -n  "$(docker ps -a -f  name=$JOB_NAME  --format '{{.ID}}' )" ]
+ then
+ #删除之前的容器
+ docker rm -f $(docker ps -a -f  name=$JOB_NAME  --format '{{.ID}}' )
+fi
+ # 清理镜像
+docker image prune -f 
+ # 启动docker服务
+docker run -d --net=host -e PARAMS="--spring.profiles.active=prod"  --name $JOB_NAME docker_storage/$JOB_NAME
+```
+
+5. 执行日志
+
+拉取代码 -> 编译打包 -> 构建镜像 -> 清理容器，创建新的容器
+
+#### 4.4 部署服务到远程服务器上
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/远程部署.png" alt="远程部署" />
+</div>
+
+##### 4.4.1 安装配置私有仓库
+
+对于持续集成环境的配置，Jenkins会发布大量的微服务， 要与多台机器进行交互， 可以采用docker镜像的保存与导出功能结合SSH实现， 但这样交互繁琐，稳定性差， 而且不便管理， 这里我们通过搭建Docker的私有仓库来实现， 这个有点类似GIT仓库， 集中统一管理资源， 由客户端拉取或更新。
+
+1. 下载最新Registry镜像
+
+   ```sh
+   docker pull registry:latest
+   ```
+
+2. 启动Registry镜像服务
+
+   ```sh
+   docker run -d -p 5000:5000 --name registry -v /usr/local/docker/registry:/var/lib/registry registry:latest
+   ```
+
+   映射5000端口； -v是将Registry内的镜像数据卷与本地文件关联， 便于管理和维护Registry内的数据。
+
+3. 查看仓库资源
+
+   访问地址：http://192.168.200.100:5000/v2/_catalog
+
+   启动正常， 可以看到返回：
+
+   ```json
+   {"repositories":[]}
+   ```
+
+   目前并没有上传镜像， 显示空数据。
+
+4. 配置Docker客户端
+
+   正常生产环境中使用， 要配置HTTPS服务， 确保安全，内部开发或测试集成的局域网环境，可以采用简便的方式， 不做安全控制。
+
+   先确保持续集成环境的机器已安装好Docker客户端， 然后做以下修改：
+
+   ```sh
+   vi /lib/systemd/system/docker.service
+   ```
+
+   修改内容：
+
+   ```sh
+   ExecStart=/usr/bin/dockerd --insecure-registry 192.168.200.100:5000
+   ```
+
+   指向安装Registry的服务IP与端口。
+
+   重启生效：
+
+   ```sh
+   systemctl daemon-reolad
+   systemctl restart docker.service
+   ```
+
+##### 4.4.2 jenkins中安装插件
+
+位置：Manage Jenkins-->Configure System
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/Jenkins中安装插件.png" alt="Jenkins中安装插件" />
+</div>
+
+##### 4.4.3 jenkins系统配置远程服务器链接
+
+位置：Manage Jenkins-->Configure System
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/Jenkins配置远程服务器链接.png" alt="Jenkins配置远程服务器链接" />
+</div>
+maven命令
+
+```java
+clean install -Dmaven.test.skip=true dockerfile:build -f heima-leadnews/heima-leadnews-service/heima-leadnews-article/pom.xml
+```
+
+shell脚本
+
+```shell
+image_tag=$docker_registry/docker_storage/$JOB_NAME
+echo '================docker镜像清理================'
+if [ -n  "$(docker ps -a -f  name=$JOB_NAME  --format '{{.ID}}' )" ]
+ then
+ #删除之前的容器
+ docker rm -f $(docker ps -a -f  name=$JOB_NAME  --format '{{.ID}}' )
+fi
+ # 清理镜像
+docker image prune -f 
+
+# 创建TAG
+docker tag docker_storage/$JOB_NAME $image_tag
+echo '================docker镜像推送================'
+# 推送镜像
+docker push $image_tag
+# 删除TAG
+docker rmi $image_tag
+echo '================docker tag 清理 ================'
+```
+
+##### 4.4.4 在远程服务器上执行脚本
+
+远程服务器执行的shell脚本
+
+```shell
+echo '================拉取最新镜像================'
+docker pull $docker_registry/docker_storage/$JOB_NAME
+
+echo '================删除清理容器镜像================'
+if [ -n  "$(docker ps -a -f  name=$JOB_NAME  --format '{{.ID}}' )" ]
+ then
+ #删除之前的容器
+ docker rm -f $(docker ps -a -f  name=$JOB_NAME  --format '{{.ID}}' )
+fi
+ # 清理镜像
+docker image prune -f 
+
+echo '===============启动容器================'
+docker run -d   --net=host -e PARAMS="--spring.profiles.active=prod" --name $JOB_NAME $docker_registry/docker_storage/$JOB_NAME
+```
+
+##### 4.4.5 构建完成以后，可以登录130服务器，查看是否有相关的镜像和容器
+
+#### 4.5 联调测试
+
+1.参考jenkins中heima-leadnews-user微服务把app端网关部署起来
+
+2.修改本地nginx中的配置反向代理地址为100这台服务器：heima-leadnews-app.conf
+
+```html
+upstream  heima-app-gateway{
+	server 192.168.200.100:51601;
+}
+```
+
+3.启动nginx，打开页面进行测试
+
+### 5. jenkins触发器配置
+
+#### 5.1 URL触发远程构建
+
+触发远程构建，修改jenkins的配置，如下
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/URL触发.png" alt="URL触发" />
+</div>
+
+触发构建url： http://192.168.200.100:16060/job/leadnews-admin/build?token=88888888
+
+#### 5.2 其他工程构建后触发
+
+配置需要触发的工程
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/其他工程构建触发.png" alt="其他工程构建触发" />
+</div>
+
+#### 5.3 定时构建
+
+定时构建（ Build periodically）
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/定时触发.png" alt="定时触发" />
+</div>
+
+定时字符串从左往右分别为： 分 时 日 月 周
+
+**定时构建-定时表达式**
+
+定时字符串从左往右分别为： 分 时 日 月 周
+
+| 组成部分 | 含义        | 取值范围                   |
+| -------- | ----------- | -------------------------- |
+| 第一部分 | minute (分) | 0~59                       |
+| 第二部分 | hour(小时)  | 0~23                       |
+| 第三部分 | day(天)     | 1~31                       |
+| 第四部分 | month(月)   | 1~12                       |
+| 第五部分 | week(周)    | 0~7，0 和 7 都是表示星期天 |
+
+- 符号H 表示一个随机数
+
+- 符号*  取值范围的任意值
+
+案例：
+
+- 每30分钟构建一次：H/30 * * * * 10:02 10:32
+
+- 每2个小时构建一次: H H/2 * * *
+
+- 每天的8点，12点，22点，一天构建3次： (多个时间点中间用逗号隔开) 0 8,12,22 * * *
+
+- 每天中午12点定时构建一次 H 12 * * *
+
+- 每天下午18点定时构建一次 H 18 * * *
+
+#### 5.4 轮询
+
+轮询 SCM（Poll SCM）
+
+轮询SCM，是指定时扫描本地代码仓库的代码是否有变更，如果代码有变更就触发项目构建。
+
+<div align="center">
+    <img src="截图/项目部署_持续集成/轮询.png" alt="轮询" />
+</div>
+
+Jenkins会定时扫描本地整个项目的代码，增大系统的开销，不建议使用。
