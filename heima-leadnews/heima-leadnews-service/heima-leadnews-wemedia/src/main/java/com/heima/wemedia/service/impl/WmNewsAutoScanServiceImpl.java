@@ -78,10 +78,10 @@ public class WmNewsAutoScanServiceImpl implements WmNewsAutoScanService {
         */
 
             //3.审核图片  提取图片文本信息进行文字自管理敏感词识别+阿里云接口识别图片
-        /* 默认审核通过
+//         默认审核通过
             boolean isImageScan = handleImageScan((List<String>) textAndImages.get("images"), wmNews);
             if(!isImageScan)return;
-        */
+
 
             //4.审核成功，保存app端的相关的文章数据
             try5SaveAppArticle(wmNews);
@@ -257,25 +257,25 @@ public class WmNewsAutoScanServiceImpl implements WmNewsAutoScanService {
         }
 
         //审核图片
-        try {
-            Map map = greenImageScan.imageScan(imageList);
-            if(map != null){
-                //审核失败
-                if(map.get("suggestion").equals("block")){
-                    flag = false;
-                    updateWmNews(wmNews, WmNews.Status.FAIL.getCode(), "当前文章中存在违规内容");
-                }
-
-                //不确定信息 需要人工审核
-                if(map.get("suggestion").equals("review")){
-                    flag = false;
-                    updateWmNews(wmNews, WmNews.Status.ADMIN_AUTH.getCode(), "当前文章中存在不确定内容");
-                }
-            }
-        } catch (Exception e) {
-            flag = false;
-            e.printStackTrace();
-        }
+//        try {
+//            Map map = greenImageScan.imageScan(imageList);
+//            if(map != null){
+//                //审核失败
+//                if(map.get("suggestion").equals("block")){
+//                    flag = false;
+//                    updateWmNews(wmNews, WmNews.Status.FAIL.getCode(), "当前文章中存在违规内容");
+//                }
+//
+//                //不确定信息 需要人工审核
+//                if(map.get("suggestion").equals("review")){
+//                    flag = false;
+//                    updateWmNews(wmNews, WmNews.Status.ADMIN_AUTH.getCode(), "当前文章中存在不确定内容");
+//                }
+//            }
+//        } catch (Exception e) {
+//            flag = false;
+//            e.printStackTrace();
+//        }
 
         return flag;
     }
