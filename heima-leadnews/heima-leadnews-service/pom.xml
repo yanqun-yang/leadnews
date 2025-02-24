@@ -14,6 +14,7 @@
         <module>heima-leadnews-wemedia</module>
         <module>heima-leadnews-schedule</module>
         <module>heima-leadnews-search</module>
+        <module>behavior-service</module>
     </modules>
     <modelVersion>4.0.0</modelVersion>
 

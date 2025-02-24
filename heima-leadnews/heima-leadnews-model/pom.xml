@@ -13,6 +13,11 @@
     <name>heima-leadnews-model</name>
 
     <dependencies>
+        <!--fastdfs-->
+        <dependency>
+            <groupId>com.github.tobato</groupId>
+            <artifactId>fastdfs-client</artifactId>
+        </dependency>
         <dependency>
             <groupId>mysql</groupId>
             <artifactId>mysql-connector-java</artifactId>
