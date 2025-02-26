@@ -1,4 +1,4 @@
-package com.heima.behavior.service;
+package com.heima.article.service;
 
 import com.heima.model.behavior.dtos.ArticleBehaviorDto;
 import com.heima.model.common.dtos.ResponseResult;

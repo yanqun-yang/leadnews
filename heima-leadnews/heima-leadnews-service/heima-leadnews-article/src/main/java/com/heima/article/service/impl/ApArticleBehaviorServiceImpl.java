@@ -1,6 +1,6 @@
-package com.heima.behavior.service.impl;
+package com.heima.article.service.impl;
 
-import com.heima.behavior.service.ApArticleBehaviorService;
+import com.heima.article.service.ApArticleBehaviorService;
 import com.heima.common.constants.BehaviorConstants;
 import com.heima.common.redis.CacheService;
 import com.heima.model.behavior.dtos.ArticleBehaviorDto;
