@@ -15,6 +15,7 @@ public class ArticleBehaviorDto {
     Long articleId;
 
     // 作者ID
+    @NotNull(message = "作者id不能为空")
     Integer authorId;
 
     // 作者对应的apuserid
