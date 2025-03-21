@@ -3,14 +3,17 @@ package com.heima.behavior.service.impl;
 import com.alibaba.fastjson.JSON;
 import com.heima.behavior.service.AppLikesBehaviorService;
 import com.heima.common.constants.BehaviorConstants;
+import com.heima.common.constants.HotArticleConstants;
 import com.heima.common.redis.CacheService;
 import com.heima.model.behavior.dtos.LikesBehaviorDto;
 import com.heima.model.common.dtos.ResponseResult;
 import com.heima.model.common.enums.AppHttpCodeEnum;
+import com.heima.model.mess.UpdateArticleMess;
 import com.heima.model.user.pojos.ApUser;
 import com.heima.utils.thread.AppThreadLocalUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
 
@@ -20,6 +23,8 @@ public class AppLikesBehaviorServiceImpl implements AppLikesBehaviorService {
 
     @Autowired
     private CacheService cacheService;
+    @Autowired
+    private KafkaTemplate<String, String> kafkaTemplate;
 
     /**
      * 点赞或取消点赞功能
@@ -40,6 +45,11 @@ public class AppLikesBehaviorServiceImpl implements AppLikesBehaviorService {
             return ResponseResult.errorResult(AppHttpCodeEnum.NEED_LOGIN);
         }
         Object object = cacheService.hGet(BehaviorConstants.LIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+
+        UpdateArticleMess mess = new UpdateArticleMess();
+        mess.setArticleId(dto.getArticleId());
+        mess.setType(UpdateArticleMess.UpdateArticleType.LIKES);
+
         // 3. 如果是点赞操作  判断是否已经点过赞
         if(dto.getOperation() == 0){
             if(object != null){
@@ -48,6 +58,8 @@ public class AppLikesBehaviorServiceImpl implements AppLikesBehaviorService {
             // 保存当前key
             log.info("当前保存key：{}， {}， {}", dto.getArticleId(),user.getId(), dto);
             cacheService.hPut(BehaviorConstants.LIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString(), JSON.toJSONString(dto));
+
+            mess.setAdd(1);
         }else {
             if(object == null){
                 return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID, "未点赞无法取消点赞");
@@ -55,7 +67,11 @@ public class AppLikesBehaviorServiceImpl implements AppLikesBehaviorService {
             // 删除当前key
             log.info("删除当前key：{}， {}", BehaviorConstants.LIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
             cacheService.hDelete(BehaviorConstants.LIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+            mess.setAdd(-1);
         }
+
+        //发送消息, 数据聚合
+        kafkaTemplate.send(HotArticleConstants.HOT_ARTICLE_SCORE_TOPIC, JSON.toJSONString(mess));
 
         return ResponseResult.okResult(AppHttpCodeEnum.SUCCESS);
     }
