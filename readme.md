@@ -6551,7 +6551,861 @@ public ResponseResult load2(ArticleHomeDto dto, Short type, boolean firstPage) {
     }
 ```
 
-## 十五、热点文章-实时计算
+## 十五、用户行为
+
+用户行为数据的记录包括了关注、点赞、不喜欢、收藏、阅读等行为
+
+所谓“埋点”，是数据采集领域（尤其是用户行为数据采集领域）的术语，指的是针对特定用户行为或事件进行捕获、处理和发送的相关技术及其实施过程。比如用户某个icon点击次数、阅读文章的时长，观看视频的时长等等。
+
+### 1. 点赞或取消点赞
+
+#### 1.1 需求分析
+
+<div align="center">
+    <img src="截图/用户行为/点赞.png" alt="点赞" />
+</div>
+
+- 当前登录的用户点击了”赞“,就要保存当前行为数据
+- 可以取消点赞
+
+#### 1.2 接口设计
+
+**接口地址**:`/api/v1/likes_behavior`
+
+**请求方式**:`POST`
+
+**请求示例**:
+
+
+```javascript
+{
+	"articleId": 0,
+	"operation": 0,
+	"type": 0
+}
+```
+
+#### 1.3 行为微服务搭建
+
+##### 1.3.1创建behavior-service
+
+处理行为是一个量比较大的操作，所以专门创建一个微服务来处理行为相关操作。
+
+##### 1.3.2 准备行为实体查询
+
+```java
+@Data
+public class LikesBehaviorDto {
+
+    // 设备ID
+    Integer equipmentId;
+
+
+    // 文章、动态、评论等ID
+    @NotNull(message = "文章id不能为空")
+    Long articleId;
+
+    /**
+     * 喜欢内容类型
+     * 0文章
+     * 1动态
+     * 2评论
+     */
+    Short type;
+
+    /**
+     * 喜欢操作方式
+     * 0 点赞
+     * 1 取消点赞
+     */
+    @Range(min = 0, max = 1, message = "点赞方式只能是0或1")
+    Short operation;
+}
+```
+
+##### 1.3.3 添加拦截器
+
+在功能实现的时候需要得到行为实体，所以需要得到当前登录的用户信息，参考文章微服务，添加拦截器，获取用户信息放到当前线程中
+
+```java
+public class AppTokenInterceptor implements HandlerInterceptor {
+
+    /**
+     * 得到header中的用户信息,并且存入到当前线程中
+     * @param request
+     * @param response
+     * @param handler
+     * @return
+     * @throws Exception
+     */
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
+        String userId = request.getHeader("userId");
+        if(userId != null){
+            //存入到当前线程中
+            ApUser apUser = new ApUser();
+            apUser.setId(Integer.valueOf(userId));
+            AppThreadLocalUtil.setUser(apUser);
+        }
+        return true;
+    }
+
+    /**
+     * 清理线程中的数据-----(抛异常不会清理)
+     * @param request
+     * @param response
+     * @param handler
+     * @param modelAndView
+     * @throws Exception
+     */
+    @Override
+    public void postHandle(HttpServletRequest request, HttpServletResponse response, Object handler, ModelAndView modelAndView) throws Exception {
+//        AppThreadLocalUtil.clear();
+    }
+
+    /**
+     * 清理线程中的数据-----(抛异常会清理)
+     * @param request
+     * @param response
+     * @param handler
+     * @param ex
+     * @throws Exception
+     */
+    @Override
+    public void afterCompletion(HttpServletRequest request, HttpServletResponse response, Object handler, Exception ex) throws Exception {
+        AppThreadLocalUtil.clear();
+    }
+}
+
+```
+
+#### 1.4 核心代码
+
+```java
+@Service
+@Slf4j
+public class AppLikesBehaviorServiceImpl implements AppLikesBehaviorService {
+
+    @Autowired
+    private CacheService cacheService;
+
+    /**
+     * 点赞或取消点赞功能
+     * @param dto
+     * @return
+     */
+    @Override
+    public ResponseResult like(LikesBehaviorDto dto) {
+
+        // 1. 校验参数
+        if(dto == null || dto.getArticleId() == null || !checkParam(dto)){
+            return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID);
+        }
+        // 2. 点赞需要登录
+        ApUser user = AppThreadLocalUtil.getUser();
+        // 游客，需要登录才能点赞
+        if(user.getId() == 0){
+            return ResponseResult.errorResult(AppHttpCodeEnum.NEED_LOGIN);
+        }
+        Object object = cacheService.hGet(BehaviorConstants.LIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+        // 3. 如果是点赞操作  判断是否已经点过赞
+        if(dto.getOperation() == 0){
+            if(object != null){
+                return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID, "已点赞");
+            }
+            // 保存当前key
+            log.info("当前保存key：{}， {}， {}", dto.getArticleId(),user.getId(), dto);
+            cacheService.hPut(BehaviorConstants.LIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString(), JSON.toJSONString(dto));
+        }else {
+            if(object == null){
+                return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID, "未点赞无法取消点赞");
+            }
+            // 删除当前key
+            log.info("删除当前key：{}， {}", BehaviorConstants.LIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+            cacheService.hDelete(BehaviorConstants.LIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+        }
+
+        return ResponseResult.okResult(AppHttpCodeEnum.SUCCESS);
+    }
+
+    /**
+     * 检查参数
+     * @param dto
+     * @return true参数合法，false不参数合法
+     */
+    private boolean checkParam(LikesBehaviorDto dto){
+        if(dto.getType() > 2 || dto.getType() < 0 || dto.getOperation() > 1 || dto.getOperation() < 0){
+            return false;
+        }
+        return true;
+    }
+}
+
+```
+
+### 2. 阅读行为
+
+#### 2.1 需求分析
+
+当用户查看了某一篇文章，需要记录当前用户**查看的次数**，阅读时长，阅读文章的比例，加载的时长（非必要）
+
+#### 2.2 接口设计
+
+**接口地址**:`/api/v1/read_behavior`
+
+**请求方式**:`POST`
+
+
+```javascript
+{
+	"articleId": 0,
+	"count": 0
+}
+```
+
+#### 2.3 dto
+
+```java
+@Data
+public class ReadBehaviorDto {
+
+    // 设备ID
+    Integer equipmentId;
+
+    // 文章、动态、评论等ID
+    @NotNull(message = "文章id不能为空")
+    Long articleId;
+
+    /**
+     * 阅读次数
+     */
+    Short count;
+}
+```
+
+#### 2.4 核心代码
+
+```java
+@Service
+@Slf4j
+public class AppReadBehaviorServiceImpl implements AppReadBehaviorService {
+
+    @Autowired
+    private CacheService cacheService;
+
+    /**
+     * 阅读功能
+     * @param dto
+     * @return
+     */
+    @Override
+    public ResponseResult read(ReadBehaviorDto dto) {
+
+        //1.校验参数
+        if(dto == null || dto.getArticleId() == null || dto.getCount() <= 0){
+            return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID);
+        }
+        //获取登录用户
+        ApUser user = AppThreadLocalUtil.getUser();
+
+        //2.如果是游客，不用记录阅读次数
+        if(user == null || user.getId() == 0){
+            return ResponseResult.okResult(AppHttpCodeEnum.SUCCESS);
+        }
+
+        //3.判断阅读行为是否存在
+        Object object = cacheService.hGet(BehaviorConstants.READ_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+        //存在,更新count
+        if(object != null){
+            log.info("Redis查询到的数据: {}", object);
+            int count = Integer.valueOf(String.valueOf(object))+dto.getCount();
+            cacheService.hPut(BehaviorConstants.READ_BEHAVIOR+dto.getArticleId().toString(),user.getId().toString(), String.valueOf(count));
+            // 更新当前key
+            log.info("更新当前key: ArticleId = {}, userId = {}, 阅读次数 = {}", dto.getArticleId(),user.getId(), count);
+        }
+        //不存在,创建阅读行为
+        else{
+            cacheService.hPut(BehaviorConstants.READ_BEHAVIOR+dto.getArticleId().toString(),user.getId().toString(), String.valueOf(dto.getCount()));
+            // 插入当前key
+            log.info("插入当前key: ArticleId = {}, userId = {}, 阅读次数 = {}", dto.getArticleId(),user.getId(), dto.getCount());
+        }
+        return ResponseResult.okResult(AppHttpCodeEnum.SUCCESS);
+    }
+}
+```
+
+### 3. 不喜欢
+
+#### 3.1 需求分析
+
+为什么会有不喜欢？一旦用户点击了不喜欢，不再给当前用户推荐这一类型的文章信息。
+
+#### 3.2 接口设计
+
+**接口地址**:`/api/v1/un_likes_behavior`
+
+**请求方式**:`POST`
+
+
+```javascript
+{
+	"articleId": 0,
+	"type": 0
+}
+```
+
+#### 3.3 dto
+
+```java
+@Data
+public class UnLikesBehaviorDTO {
+    // 设备ID
+    Integer equipmentId;
+    // 文章ID
+    Long articleId;
+    /**
+     * 不喜欢操作方式
+     * 0 不喜欢
+     * 1 取消不喜欢
+     */
+    Short type;
+
+}
+```
+
+#### 3.4 核心代码
+
+```java
+@Service
+@Slf4j
+public class AppUnlikesBehaviorServiceImpl implements AppUnlikesBehaviorService {
+
+    @Autowired
+    private CacheService cacheService;
+
+    /**
+     * 不喜欢功能
+     * @param dto
+     * @return
+     */
+    @Override
+    public ResponseResult unlike(UnLikesBehaviorDTO dto) {
+
+        // 1. 校验参数
+        if(dto == null || dto.getArticleId() == null || !checkParam(dto)){
+            return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID);
+        }
+        // 2. 不喜欢需要登录
+        ApUser user = AppThreadLocalUtil.getUser();
+        // 游客，需要登录才能不喜欢
+        if(user.getId() == 0){
+            return ResponseResult.errorResult(AppHttpCodeEnum.NEED_LOGIN);
+        }
+        Object object = cacheService.hGet(BehaviorConstants.UNLIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+        // 3. 如果是不喜欢  判断是否已经不喜欢
+        if(dto.getType() == 0){
+            if(object != null){
+                return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID, "已不喜欢");
+            }
+            // 保存当前key
+            log.info("当前保存key：{}， {}， {}", dto.getArticleId(),user.getId(), dto);
+            cacheService.hPut(BehaviorConstants.UNLIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString(), JSON.toJSONString(dto));
+        }else { //取消不喜欢  判断是否本来就没有不喜欢
+            if(object == null){
+                return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID, "未不喜欢无法取消");
+            }
+            // 删除当前key
+            log.info("删除当前key：{}， {}", BehaviorConstants.UNLIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+            cacheService.hDelete(BehaviorConstants.UNLIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+        }
+
+        return ResponseResult.okResult(AppHttpCodeEnum.SUCCESS);
+    }
+
+    /**
+     * 检查参数
+     * @param dto
+     * @return true参数合法，false不参数合法
+     */
+    private boolean checkParam(UnLikesBehaviorDTO dto){
+        /**
+         * 不喜欢操作方式
+         * 0 不喜欢
+         * 1 取消不喜欢
+         */
+        if(dto.getType() == null || dto.getType() > 2 || dto.getType() < 0){
+            return false;
+        }
+        return true;
+    }
+}
+```
+
+### 4. app端-关注作者或取消关注
+
+#### 4.1 需求分析
+
+<div align="center">
+    <img src="截图/用户行为/关注与取消关注.png" alt="关注与取消关注" />
+</div>
+
+如上效果：
+
+当前登录后的用户可以关注作者对应的APUser ID，也可以取消关注作者对应的APUser ID
+
+#### 4.2 解决方案
+
+方案一：基于数据库保存对应的关注关系
+
+**方案二：基于Redis保存。** 
+
+项目中使用方案二。
+
+一个用户关注了作者，作者是由用户实名认证以后开通的作者权限，才有了作者信息，作者肯定是app中的一个用户。
+
+从用户的角度出发：一个用户可以关注其他多个作者 —— 我的关注
+
+从作者的角度出发：一个用户（同是作者）也可以拥有很多个粉丝  —— 我的粉丝
+
+<div align="center">
+    <img src="截图/用户行为/互粉.png" alt="互粉" />
+</div>
+
+如上图所示，在好友关注关系中，主要有以上三种状态，即：
+
+- 我的粉丝（fans）
+- 我的关注（follow）
+- 互粉（mutual）
+
+假设两个用户。用户ID分别为1和2。
+
+考虑问题：
+
+1、一对多    
+
+2、关注时间有序
+
+3、集合
+
+4、不重复
+
+**5、集合运算（交并补）**
+
+**关注文章作者：**    1 登陆用户id        2  作者对应id      关注集合       粉丝集合
+
+1. 将对方写入我的关注中。        follow:1          2 (score: 时间 )     
+
+2. 将我写入对方的粉丝中。即：         fans:2         1 
+
+示例：
+
+```properties
+ZADD follow:1 time(时间戳)  2
+ZADD fans:2 time(时间戳)    1
+```
+
+**取消关注：** 1   2
+
+1. 将对方从我的关注中移除
+2. 将我从对方的粉丝中移除
+
+示例：
+
+```properties
+ZREM follow:1 2
+ZREM fans:2 1
+```
+
+**查看关注列表：**
+
+```properties
+ZRANGE follow:1 0 -1
+```
+
+**查看粉丝列表：**
+
+```properties
+ZRANGE fans:1 0 -1
+```
+
+**关注数量：**
+
+```properties
+ZCARD follow:1
+```
+
+**粉丝数量：**
+
+```properties
+ZCARD fans:1
+```
+
+**人物关系：**
+
+1、我单向关注Ta。即我关注的Ta，但是Ta并没有关注我的
+
+```properties
+ZSCORE follow:1 2 #ture
+ZSCORE fans:1 2 #false
+# 第一条成立，第二条不成立，说明我单向关注了对方（1关注了2，而1的粉丝中没有2，说明2并没有关注1）
+```
+
+2、Ta单向关注我。即Ta关注我了，我并没有关注Ta
+
+```properties
+ZSCORE follow:1 2 #false
+ZSCORE fans:1 2 #true
+# 第一条不成立，第二条成立，说明对方单向关注了我（1没有关注2，而1的粉丝中有2，说明2关注了1）
+```
+
+3、互相关注。即我关注了Ta，Ta也关注了我
+
+```properties
+ZSCORE follow:1 2 #true
+ZSCORE fans:1 2   #true
+# 上面两条都成立，即说明互相关注了（1关注了2，并且1的粉丝中有2，说明2也关注1了）
+```
+
+#### 4.3 接口设计
+
+**接口地址**:`/api/v1/user/user_follow`
+
+**请求方式**:`POST`
+
+
+```javascript
+{
+	"articleId": 0,
+	"authorId": 0,
+	"operation": 0
+}
+```
+
+#### 4.4 dto
+
+```java
+@Data
+public class UserRelationDTO {
+    // 文章作者ID
+    Integer authorId;
+    // 作者对应的apuserid
+    Integer authorApUserId;// 未使用
+    // 文章id
+    Long articleId;
+    /**
+     * 操作方式
+     * 0  关注
+     * 1  取消
+     */
+    Short operation;
+}
+```
+
+#### 4.5 核心代码
+
+```java
+@Service
+@Slf4j
+public class ApUserRelationServiceImpl implements ApUserRelationService {
+
+    @Resource
+    private IArticleClient articleClient;
+    @Autowired
+    private CacheService cacheService;
+
+    /**
+     * 关注行为
+     * @param dto
+     * @return
+     */
+    @Override
+    public ResponseResult follow(UserRelationDTO dto) {
+        //1.校验参数  authorId、   必须登录、    operation 0 1
+        Short operation = dto.getOperation();
+        if(dto.getAuthorId() == null || (operation != 0 && operation != 1)){
+            return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID);
+        }
+        ResponseResult result = articleClient.getByWmUserId(dto.getAuthorId());
+        if(result == null | !result.getCode().equals(AppHttpCodeEnum.SUCCESS.getCode())){
+            return ResponseResult.errorResult(AppHttpCodeEnum.SERVER_ERROR);
+        }
+        ApAuthor apAuthor = JSON.parseObject(result.getData().toString(), ApAuthor.class);
+        if(apAuthor.getUserId() == null){
+            return ResponseResult.errorResult(AppHttpCodeEnum.SERVER_ERROR, "作者对应的userId不存在");
+        }
+        ApUser user = AppThreadLocalUtil.getUser();
+        if(user == null){
+            return ResponseResult.errorResult(AppHttpCodeEnum.NEED_LOGIN);
+        }
+        Integer loginId = user.getId();
+        Integer followId = apAuthor.getUserId();
+        // 判断 自己不可以关注自己
+        if(loginId.equals(followId)){
+            return ResponseResult.errorResult(AppHttpCodeEnum.SERVER_ERROR, "不可以自己关注自己~");
+        }
+        // 校验之前有没有关注过 zscore
+        // 参数1: key   参数2: 要查询集合元素
+        Double score = cacheService.zScore(UserRelationConstants.FOLLOW_LIST + loginId, String.valueOf(followId));
+
+        if(operation == 0){
+            if(score != null){
+                return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID, "您已关注，请勿重复关注");
+            }
+            // 没有关注过  zadd follow：loginId  followId
+            // 参数1: key   参数2: 集合元素  参数3: score
+            cacheService.zAdd(UserRelationConstants.FOLLOW_LIST + loginId, String.valueOf(followId), System.currentTimeMillis());
+            //           zadd fans: followId  loginId
+            cacheService.zAdd(UserRelationConstants.FANS_LIST + followId, String.valueOf(loginId), System.currentTimeMillis());
+        }else {
+            // 是1 取关
+            if(score == null){
+                return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID, "您暂未关注作者，无法取关");
+            }
+            // zrem follow: loginId  followId
+            cacheService.zRemove(UserRelationConstants.FOLLOW_LIST + loginId, String.valueOf(followId));
+            // zrem fans:  followId  loginId
+            cacheService.zRemove(UserRelationConstants.FANS_LIST + followId, String.valueOf(loginId));
+        }
+
+        return ResponseResult.okResult(AppHttpCodeEnum.SUCCESS);
+    }
+}
+```
+
+### 5. 收藏
+
+#### 5.1 需求分析
+
+记录当前登录人收藏的文章，用户在app上点击收藏，即可收藏该文章，再次点击则取消收藏
+
+#### 5.2 接口设计
+
+**接口地址**:`/api/v1/collection_behavior`
+
+**请求方式**:`POST`
+
+
+```javascript
+{
+	"entryId": 0,
+	"operation": 0,
+	"publishedTime": "",
+	"type": 0
+}
+```
+
+#### 5.3 dto
+
+```java
+@Data
+public class CollectionBehaviorDTO {
+    // 设备ID
+    Integer equipmentId;
+    // 文章、动态ID
+    @JsonAlias("entryId") // 前端变量命名entryId 实际为articleId 因此起个别名
+    Long articleId;
+    /**
+     * 收藏内容类型
+     * 0文章
+     * 1动态
+     */
+    Short type;
+    /**
+     * 操作类型
+     * 0收藏
+     * 1取消收藏
+     */
+    Short operation;
+}
+```
+
+#### 5.4 核心代码
+
+```java
+@Service
+@Slf4j
+public class AppCollectionBehaviorServiceImpl implements AppCollectionBehaviorService {
+
+    @Autowired
+    private CacheService cacheService;
+
+    /**
+     * 收藏或取消收藏功能
+     * @param dto
+     * @return
+     */
+    @Override
+    public ResponseResult collect(CollectionBehaviorDTO dto) {
+
+        // 1. 校验参数
+        if(dto == null || dto.getArticleId() == null || !checkParam(dto)){
+            return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID);
+        }
+        // 2. 收藏需要登录
+        ApUser user = AppThreadLocalUtil.getUser();
+        // 游客，需要登录才能收藏
+        if(user.getId() == 0){
+            return ResponseResult.errorResult(AppHttpCodeEnum.NEED_LOGIN);
+        }
+        Object object = cacheService.hGet(BehaviorConstants.COLLECTION_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+        // 3. 如果是收藏操作  判断是否已经收藏过
+        if(dto.getOperation() == 0){
+            if(object != null){
+                return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID, "已收藏");
+            }
+            // 保存当前key
+            log.info("当前保存key：{}， {}， {}", dto.getArticleId(),user.getId(), dto);
+            cacheService.hPut(BehaviorConstants.COLLECTION_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString(), JSON.toJSONString(dto));
+        }else {
+            if(object == null){
+                return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID, "未收藏无法取消收藏");
+            }
+            // 删除当前key
+            log.info("删除当前key：{}， {}", BehaviorConstants.COLLECTION_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+            cacheService.hDelete(BehaviorConstants.COLLECTION_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+        }
+
+        return ResponseResult.okResult(AppHttpCodeEnum.SUCCESS);
+    }
+
+    /**
+     * 检查参数
+     * @param dto
+     * @return true参数合法，false不参数合法
+     */
+    private boolean checkParam(CollectionBehaviorDTO dto){
+        /**
+         * type
+         * 收藏内容类型
+         * 0文章
+         * 1动态
+         */
+        /**
+         * operation
+         * 操作类型
+         * 0收藏
+         * 1取消收藏
+         */
+        if(dto.getType() > 1 || dto.getType() < 0 || dto.getOperation() > 1 || dto.getOperation() < 0){
+            return false;
+        }
+        return true;
+    }
+}
+```
+
+### 6. 文章详情-行为数据回显
+
+#### 6.1 需求分析
+
+主要是用来展示文章的关系，app端用户必须登录，判断当前用户**是否已经关注该文章的作者、是否收藏了此文章、是否点赞了文章、是否不喜欢该文章等**
+
+例：如果当前用户点赞了该文章，点赞按钮进行高亮，其他功能类似。
+
+#### 6.2 接口设计
+
+**接口地址**:`/api/v1/article/load_article_behavior`
+
+**请求方式**:`POST`
+
+
+```javascript
+{
+	"articleId": 0,
+	"authorId": 0
+}
+```
+
+#### 6.3 dto
+
+```java
+@Data
+public class ArticleBehaviorDto {
+
+    // 设备ID
+    Integer equipmentId;
+
+    // 文章ID
+    @NotNull(message = "文章id不能为空")
+    Long articleId;
+
+    // 作者ID
+    @NotNull(message = "作者id不能为空")
+    Integer authorId;
+
+    // 作者对应的apuserid
+    Integer authorApUserId;
+}
+```
+
+#### 6.4 核心代码
+
+```java
+@Service
+@Slf4j
+public class ApArticleBehaviorServiceImpl implements ApArticleBehaviorService {
+
+    @Autowired
+    private CacheService cacheService;
+    @Autowired
+    private ApAuthorService apAuthorService;
+
+    /**
+     * 加载文章详情 数据回显
+     * @param dto
+     * @return
+     */
+    @Override
+    public ResponseResult loadArticleBehavior(ArticleBehaviorDto dto) {
+        // 参数校验 articleId、 authorId
+        if(dto.getArticleId() == null || dto.getAuthorId() == null){
+            return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID);
+        }
+        // 获取作者的userid
+        ApAuthor apAuthor = apAuthorService.getByWmUserId(dto.getAuthorId());
+        if(apAuthor == null){
+            return ResponseResult.errorResult(AppHttpCodeEnum.PARAM_INVALID, "请检查authorId是否正确!");
+        }
+        // 初始化map
+        Map<String, Boolean> behaviorMap= new HashMap<>();
+        behaviorMap.put("isfollow", false);
+        behaviorMap.put("islike", false);
+        behaviorMap.put("isunlike", false);
+        behaviorMap.put("iscollection", false);
+        ApUser user = AppThreadLocalUtil.getUser();
+        // 是游客，直接返回所有false
+        if(user.getId() == 0){
+            return ResponseResult.okResult(behaviorMap);
+        }
+        // 获取点赞信息
+        Object obj = cacheService.hGet(BehaviorConstants.LIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+        if(obj != null){
+            behaviorMap.replace("islike", true);
+        }
+        // 获取关注信息
+        Double score = cacheService.zScore(UserRelationConstants.FOLLOW_LIST + user.getId(), apAuthor.getUserId().toString());
+        if(score != null){
+            behaviorMap.replace("isfollow", true);
+        }
+
+        // 获取不喜欢信息
+        obj = cacheService.hGet(BehaviorConstants.UNLIKE_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+        if(obj != null){
+            behaviorMap.replace("isunlike", true);
+        }
+
+        // 获取收藏信息
+        obj = cacheService.hGet(BehaviorConstants.COLLECTION_BEHAVIOR + dto.getArticleId().toString(), user.getId().toString());
+        if(obj != null){
+            behaviorMap.replace("iscollection", true);
+        }
+
+        return ResponseResult.okResult(behaviorMap);
+    }
+}
+```
+
+## 十六、热点文章-实时计算
 
 ### 1. 定时计算与实时计算
 
@@ -6743,6 +7597,7 @@ public class KafkaStreamQuickStart {
          * 处理消息的value
          */
         //flatMapValues: ("a", ["x", "y", "z"])->[('a', 'x'), ('a', 'y'), ('a', 'z')]
+        //这里对应(传来的key,"hello")、(传来的key,"kafka")
         stream.flatMapValues(new ValueMapper<String, Iterable<String>>() {
             @Override
             public Iterable<String> apply(String value) {
@@ -7363,7 +8218,7 @@ public class ArticleIncrHandleListener {
 }
 ```
 
-## 十六、项目部署_持续集成
+## 十七、项目部署_持续集成
 
 ### 1.概念
 
